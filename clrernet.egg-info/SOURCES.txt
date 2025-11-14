@@ -1,0 +1,8 @@
+LICENSE
+README.md
+setup.py
+clrernet.egg-info/PKG-INFO
+clrernet.egg-info/SOURCES.txt
+clrernet.egg-info/dependency_links.txt
+clrernet.egg-info/requires.txt
+clrernet.egg-info/top_level.txt

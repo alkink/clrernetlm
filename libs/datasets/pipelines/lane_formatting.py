@@ -8,20 +8,21 @@ from mmdet.structures import DetDataSample
 from mmengine.structures import InstanceData
 
 from libs.utils.lane_utils import sample_lane
+from libs.models.lanelm import LaneTokenizer, LaneTokenizerConfig
 
 
 @TRANSFORMS.register_module()
 class PackCLRNetInputs(BaseTransform):
     def __init__(
         self,
-        #keys=None,
+        # keys=None,
         meta_keys=None,
         max_lanes=4,
         num_points=72,
         img_w=800,
         img_h=320,
     ):
-        #self.keys = keys
+        # self.keys = keys
         self.meta_keys = meta_keys
         self.max_lanes = max_lanes
         self.n_offsets = num_points
@@ -94,4 +95,91 @@ class PackCLRNetInputs(BaseTransform):
         data_sample.set_metainfo(img_meta)
         data["data_samples"] = data_sample
         data["inputs"] = img
+        return data
+
+
+@TRANSFORMS.register_module()
+class PackLaneLMInputs(BaseTransform):
+    """Pack inputs and LaneLM-style lane tokens for training a LaneLM head.
+
+    This transform is intended for a separate LaneLM training pipeline and
+    does not affect the existing CLRerNet training.
+    """
+
+    def __init__(
+        self,
+        meta_keys=None,
+        max_lanes=4,
+        num_points=40,
+        img_w=800,
+        img_h=320,
+        nbins_x=800,
+    ):
+        self.meta_keys = meta_keys or [
+            "filename",
+            "sub_img_name",
+            "ori_shape",
+            "img_shape",
+        ]
+        self.max_lanes = max_lanes
+        self.num_points = num_points
+        self.img_w = img_w
+        self.img_h = img_h
+        self.nbins_x = nbins_x
+
+        cfg = LaneTokenizerConfig(
+            img_w=img_w,
+            img_h=img_h,
+            num_steps=num_points,
+            nbins_x=nbins_x,
+        )
+        self.tokenizer = LaneTokenizer(cfg)
+
+    def _encode_lanes(self, results):
+        """Encode gt_points into LaneLM token sequences."""
+        old_lanes = results.get("gt_points", [])
+        # Filter out lanes with too few points
+        old_lanes = [lane for lane in old_lanes if len(lane) > 3]
+
+        T = self.tokenizer.T
+        x_tokens = np.full(
+            (self.max_lanes, T), self.tokenizer.cfg.pad_token_x, dtype=np.int64
+        )
+        y_tokens = np.full((self.max_lanes, T), T, dtype=np.int64)
+        valid_mask = np.zeros((self.max_lanes,), dtype=np.int64)
+
+        for lane_idx, lane in enumerate(old_lanes):
+            if lane_idx >= self.max_lanes:
+                break
+            coords = np.array(lane, dtype=np.float32).reshape(-1, 2)
+            xt, yt = self.tokenizer.encode_single_lane(coords)
+            x_tokens[lane_idx] = xt
+            y_tokens[lane_idx] = yt
+            # Mark lane as valid if it has at least one non-padding token
+            if np.any(xt != self.tokenizer.cfg.pad_token_x):
+                valid_mask[lane_idx] = 1
+
+        results["lane_tokens_x"] = to_tensor(x_tokens.astype(np.int64)).long()
+        results["lane_tokens_y"] = to_tensor(y_tokens.astype(np.int64)).long()
+        results["lane_valid_mask"] = to_tensor(valid_mask.astype(np.int64)).long()
+        return results
+
+    def transform(self, results):
+        """Convert image and lane annotations into tensors and tokens."""
+        data = {}
+        if "img" in results:
+            img = results["img"]
+            # Convert to float and normalize to [0, 1]
+            img = to_tensor(img.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
+
+        results = self._encode_lanes(results)
+
+        # Minimal metadata pass-through for potential debugging
+        meta = {key: results.get(key, None) for key in self.meta_keys}
+
+        data["inputs"] = img
+        data["lane_tokens_x"] = results["lane_tokens_x"]
+        data["lane_tokens_y"] = results["lane_tokens_y"]
+        data["lane_valid_mask"] = results["lane_valid_mask"]
+        data["metainfo"] = meta
         return data
