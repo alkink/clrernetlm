@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -58,6 +58,101 @@ class KeypointEmbedding(nn.Module):
         pos_emb = self.pos_embedding(pos_ids)
 
         return x_emb + y_emb + pos_emb
+
+
+class VisualTokenEncoder(nn.Module):
+    """Encode multi-scale CNN/FPN feature maps into visual tokens.
+
+    This follows the LaneLM formulation (Eq. 7-8 in the paper):
+      - use a pyramid feature extractor f to obtain {F0, F1, F2}
+      - split each Fi into patches, linearly embed them and add
+        positional and level embeddings.
+
+    In practice we assume Fi are the FPN outputs from CLRerNetFPN:
+      Fi: (B, C_i, H_i, W_i)
+    and flatten each spatial location as a "patch".
+    """
+
+    def __init__(
+        self,
+        in_channels: Sequence[int],
+        embed_dim: int,
+    ) -> None:
+        super().__init__()
+        self.in_channels = list(in_channels)
+        self.embed_dim = embed_dim
+
+        # Per-level linear projection to embed_dim
+        self.proj_per_level = nn.ModuleList(
+            [nn.Linear(c, embed_dim) for c in self.in_channels]
+        )
+
+        # Level embeddings (encode which FPN level a token comes from)
+        self.level_embed = nn.Embedding(len(self.in_channels), embed_dim)
+
+        # We use simple learnable 1D positional embedding over the concatenated
+        # sequence length (N_total). This is a pragmatic approximation of
+        # PE_vision(H_i, W_i) in the paper.
+        # For CLRerNet FPN on 800x320 inputs, the three feature levels are
+        # typically 40x100, 20x50 and 10x25, i.e. 4000 + 1000 + 250 = 5250
+        # tokens. We set a safe upper bound here.
+        self.max_tokens = 8192
+        self.pos_embedding = nn.Embedding(self.max_tokens, embed_dim)
+
+    def forward(self, feats: Sequence[torch.Tensor]) -> torch.Tensor:
+        """Encode FPN feature maps into a single token sequence.
+
+        Args:
+            feats: sequence of tensors [F0, F1, F2], each of shape (B, C_i, H_i, W_i).
+
+        Returns:
+            visual_tokens: (B, N_total, D) where N_total=sum_i H_i*W_i.
+        """
+        if len(feats) != len(self.in_channels):
+            raise ValueError(
+                f"Expected {len(self.in_channels)} feature maps, "
+                f"got {len(feats)}."
+            )
+
+        batch_size = feats[0].shape[0]
+        device = feats[0].device
+
+        level_tokens: List[torch.Tensor] = []
+        for lvl, (feat, proj) in enumerate(zip(feats, self.proj_per_level)):
+            B, C, H, W = feat.shape
+            if C != self.in_channels[lvl]:
+                raise ValueError(
+                    f"Unexpected channels at level {lvl}: "
+                    f"got {C}, expected {self.in_channels[lvl]}."
+                )
+
+            # (B, C, H, W) -> (B, H*W, C)
+            x = feat.view(B, C, H * W).permute(0, 2, 1).contiguous()
+            # Linear projection to embed_dim
+            x = proj(x)  # (B, H*W, D)
+
+            # Add level embedding
+            lvl_emb = self.level_embed.weight[lvl].view(1, 1, -1)  # (1,1,D)
+            x = x + lvl_emb
+            level_tokens.append(x)
+
+        # Concatenate levels along token dimension
+        visual_tokens = torch.cat(level_tokens, dim=1)  # (B, N_total, D)
+        _, n_tokens, _ = visual_tokens.shape
+        if n_tokens > self.max_tokens:
+            raise ValueError(
+                f"Number of visual tokens {n_tokens} exceeds "
+                f"max_tokens={self.max_tokens}."
+            )
+
+        # Positional embedding over the concatenated sequence
+        pos_ids = torch.arange(n_tokens, device=device).unsqueeze(0).expand(
+            batch_size, -1
+        )
+        pos_emb = self.pos_embedding(pos_ids)
+        visual_tokens = visual_tokens + pos_emb
+
+        return visual_tokens
 
 
 class LaneLMDecoderLayer(nn.Module):
@@ -240,6 +335,7 @@ class LaneLMModel(nn.Module):
         max_seq_len: int = 64,
         dropout: float = 0.1,
         visual_in_dim: Optional[int] = None,
+        visual_in_channels: Optional[Sequence[int]] = None,
     ) -> None:
         super().__init__()
         self.nbins_x = nbins_x
@@ -247,13 +343,26 @@ class LaneLMModel(nn.Module):
         self.embed_dim = embed_dim
         self.max_seq_len = max_seq_len
 
-        # Optional projection from backbone feature dimension to embed_dim.
-        # If visual_in_dim is None or equals embed_dim, the projection becomes identity.
-        self.visual_in_dim = visual_in_dim or embed_dim
-        if self.visual_in_dim != embed_dim:
-            self.visual_proj = nn.Linear(self.visual_in_dim, embed_dim)
-        else:
+        # Visual encoder: either a simple linear projection from a single
+        # feature map (legacy path, visual_in_dim) or a multi-scale token
+        # encoder over a pyramid of feature maps (visual_in_channels).
+        self.visual_encoder: Optional[VisualTokenEncoder]
+        if visual_in_channels is not None:
+            # Multi-level FPN features -> tokens
+            self.visual_encoder = VisualTokenEncoder(
+                in_channels=visual_in_channels,
+                embed_dim=embed_dim,
+            )
             self.visual_proj = None
+        else:
+            self.visual_encoder = None
+            # Optional projection from backbone feature dimension to embed_dim.
+            # If visual_in_dim is None or equals embed_dim, the projection becomes identity.
+            self.visual_in_dim = visual_in_dim or embed_dim
+            if self.visual_in_dim != embed_dim:
+                self.visual_proj = nn.Linear(self.visual_in_dim, embed_dim)
+            else:
+                self.visual_proj = None
 
         self.keypoint_embed = KeypointEmbedding(
             nbins_x=nbins_x,
@@ -284,8 +393,14 @@ class LaneLMModel(nn.Module):
         """Forward pass.
 
         Args:
-            visual_tokens: (B, N, D_v) visual feature tokens. If D_v != embed_dim,
-                it should be projected beforehand by the caller.
+            visual_tokens:
+                - If visual_encoder is None:
+                    (B, N, D_v) visual feature tokens. If D_v != embed_dim,
+                    it will be projected to embed_dim.
+                - If visual_encoder is not None:
+                    sequence of FPN feature maps is expected instead and this
+                    argument will be ignored (see note below).
+
             x_tokens: (B, T) discrete x tokens.
             y_tokens: (B, T) discrete y / step tokens.
             visual_padding_mask: optional (B, N) mask for visual tokens.
@@ -293,9 +408,19 @@ class LaneLMModel(nn.Module):
         Returns:
             logits_x: (B, T, nbins_x)
             logits_y: (B, T, max_y_tokens)
+        Note:
+            - If ``visual_in_channels`` was provided at construction time,
+              callers are expected to pass the output of
+              :meth:`encode_visual_tokens` as ``visual_tokens``. In that case
+              no further projection is applied here.
+            - If only ``visual_in_dim`` was provided, ``visual_tokens`` is
+              projected to ``embed_dim`` when necessary.
         """
-        # Project visual tokens to the model's embedding dimension if necessary.
-        if self.visual_proj is not None:
+        # Encode / project visual tokens to the model's embedding dimension.
+        if self.visual_encoder is not None:
+            # visual_tokens are assumed to be already encoded to (B, N, D).
+            pass
+        elif self.visual_proj is not None:
             visual_tokens = self.visual_proj(visual_tokens)
 
         keypoint_emb = self.keypoint_embed(x_tokens, y_tokens)
@@ -306,3 +431,16 @@ class LaneLMModel(nn.Module):
         )
         logits_x, logits_y = self.head(hidden)
         return logits_x, logits_y
+
+    def encode_visual_tokens(self, feats: Sequence[torch.Tensor]) -> torch.Tensor:
+        """Encode multi-level FPN features into visual tokens.
+
+        This is the preferred entry point when LaneLMModel was constructed
+        with ``visual_in_channels``. It wraps ``VisualTokenEncoder``.
+        """
+        if self.visual_encoder is None:
+            raise RuntimeError(
+                "encode_visual_tokens() was called but LaneLMModel was "
+                "constructed without visual_in_channels."
+            )
+        return self.visual_encoder(feats)

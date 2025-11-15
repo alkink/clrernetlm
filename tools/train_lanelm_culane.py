@@ -30,6 +30,26 @@ from libs.datasets.pipelines.lane_formatting import PackLaneLMInputs
 from libs.models.lanelm import LaneLMModel
 
 
+def collate_lanelm_batch(batch):
+    """Custom collate function for LaneLM batches.
+
+    Handles metainfo as list of dicts and stacks tensor inputs.
+    """
+    inputs = torch.stack([item["inputs"] for item in batch])
+    lane_tokens_x = torch.stack([item["lane_tokens_x"] for item in batch])
+    lane_tokens_y = torch.stack([item["lane_tokens_y"] for item in batch])
+    lane_valid_mask = torch.stack([item["lane_valid_mask"] for item in batch])
+    metainfo = [item["metainfo"] for item in batch]
+
+    return {
+        "inputs": inputs,
+        "lane_tokens_x": lane_tokens_x,
+        "lane_tokens_y": lane_tokens_y,
+        "lane_valid_mask": lane_valid_mask,
+        "metainfo": metainfo,
+    }
+
+
 def build_culane_lanelm_dataloader(
     data_root: str,
     list_path: str,
@@ -90,6 +110,7 @@ def build_culane_lanelm_dataloader(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn=collate_lanelm_batch,
     )
     return dataloader
 
