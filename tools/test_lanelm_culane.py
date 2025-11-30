@@ -1,520 +1,452 @@
 """
-Evaluate a LaneLM-style head on CULane using the same
-evaluation logic as CLRerNet (CULaneMetric + .lines.txt files).
+LaneLM CULane Test Script.
 
-This script mirrors the CLI style of `tools/test.py` but runs a
-custom PyTorch inference loop:
-  - uses a frozen CLRerNet backbone + FPN as visual encoder
-  - loads a LaneLMModel checkpoint trained by `tools/train_lanelm_culane.py`
-  - autoregressively decodes lane keypoint tokens
-  - decodes tokens into lane geometries and evaluates with CULaneMetric
+Purpose:
+  Evaluate LaneLM model on CULane test set using official metrics.
+  Generates lane predictions, saves them as .lines.txt files,
+  and computes F1/Precision/Recall scores.
 
-Important notes:
-  - LaneLM inference here is a minimal, greedy autoregressive decoder
-    (1 lane per image by default). It is suitable as a smoke test and
-    for qualitative analysis, not a final reproduction of the LaneLM paper.
-  - The CULane evaluation *metric and data flow* (writing .lines.txt,
-    categories, IoU computation) are identical to the CLRerNet test pipeline.
+Usage:
+  python tools/test_lanelm_culane.py --checkpoint work_dirs/lanelm_2k_subset/lanelm_2k_best.pth
 """
 
 import argparse
 import os
-from typing import List, Tuple
-
 import numpy as np
 import torch
+from pathlib import Path
+from tqdm import tqdm
+
 from torch.utils.data import DataLoader
 
-from mmengine.config import Config
-
 from libs.datasets import CulaneDataset
-from libs.datasets.metrics.culane_metric import CULaneMetric
-from libs.models.lanelm import LaneTokenizer, LaneTokenizerConfig
-from libs.utils.lane_utils import Lane
+from libs.datasets.metrics.culane_metric import eval_predictions
+from libs.models.lanelm import LaneLMModel, LaneTokenizer, LaneTokenizerConfig
 
-from tools.train_lanelm_culane import (  # type: ignore
-    build_frozen_clrernet,
-    build_lanelm_model,
-    extract_visual_tokens,
+from tools.train_lanelm_culane_v3 import (
+    LaneLMHyperParams,
+    build_frozen_clrernet_backbone,
+    build_lanelm_model_v3,
 )
 
+from configs.clrernet.culane.dataset_culane_clrernet import (
+    compose_cfg,
+    crop_bbox,
+    img_scale,
+)
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Test LaneLM head on CULane using CLRerNet backbone and CULaneMetric."
-    )
-    parser.add_argument(
-        "config",
-        type=str,
-        help="Path to CLRerNet config file (same as for tools/test.py).",
-    )
-    parser.add_argument(
-        "clrernet_checkpoint",
-        type=str,
-        help="Path to CLRerNet pretrained checkpoint (backbone + FPN).",
-    )
-    parser.add_argument(
-        "lanelm_checkpoint",
-        type=str,
-        help="Path to LaneLM checkpoint produced by tools/train_lanelm_culane.py.",
-    )
-    parser.add_argument(
-        "--data-root",
-        type=str,
-        default="dataset",
-        help="CULane dataset root. Default: %(default)s",
-    )
-    parser.add_argument(
-        "--test-list",
-        type=str,
-        default="dataset/list/test.txt",
-        help="CULane test list file relative to repo root. Default: %(default)s",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-        help="Batch size for LaneLM inference. Default: %(default)s",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="Number of DataLoader workers. Default: %(default)s",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        choices=["cuda", "cpu"],
-        help="Device to use for inference. Default: %(default)s",
-    )
-    parser.add_argument(
-        "--num-lanes-per-image",
-        type=int,
-        default=1,
-        help=(
-            "Number of LaneLM-generated lanes per image. "
-            "Currently only 1 is supported in decoding; values >1 are treated as 1."
-        ),
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help=(
-            "Sampling temperature for token decoding. "
-            "0.0 means greedy argmax. Default: %(default)s"
-        ),
-    )
-    parser.add_argument(
-        "--work-dir",
-        type=str,
-        default=None,
-        help="Optional directory to save evaluation logs/results.",
-    )
-    args = parser.parse_args()
-    return args
-
-
-def collate_lanelm_batch(batch):
-    """Custom collate function for LaneLM batches.
-
-    Handles metainfo as list of dicts instead of trying to stack them.
-    """
-    inputs = torch.stack([item["inputs"] for item in batch])
-    metainfo = [item["metainfo"] for item in batch]
-
-    # For test mode, we don't have lane tokens, just return inputs and metainfo
-    return {
-        "inputs": inputs,
-        "metainfo": metainfo,
-    }
-
-
-def build_culane_lanelm_test_dataloader(
-    data_root: str,
-    list_path: str,
-    batch_size: int,
-    num_workers: int,
-    img_w: int,
-    img_h: int,
-    max_lanes: int,
-    num_points: int,
-    nbins_x: int,
-) -> DataLoader:
-    """Build a CULane DataLoader for LaneLM inference.
-
-    This mirrors the CULane val/test pipeline (Crop + Resize) by reusing
-    `val_al_pipeline` from the CLRerNet dataset config and PackLaneLMInputs
-    for image preprocessing. Ground-truth tokens are *not* used here.
-    """
-    from configs.clrernet.culane.dataset_culane_clrernet import (  # type: ignore
-        val_al_pipeline,
-    )
-    from libs.datasets.pipelines.lane_formatting import PackLaneLMInputs
-
-    # Albumentations-based deterministic test pipeline (Crop + Resize).
+# Clean test pipeline (no augmentations)
     test_pipeline = [
-        dict(type="albumentation", pipelines=val_al_pipeline),
+    dict(type="Compose", params=compose_cfg),
         dict(
-            type="PackLaneLMInputs",
-            meta_keys=[
-                "filename",
-                "sub_img_name",
-                "ori_shape",
-                "img_shape",
-            ],
-            max_lanes=max_lanes,
-            num_points=num_points,
-            img_w=img_w,
-            img_h=img_h,
-            nbins_x=nbins_x,
-        ),
+        type="Crop",
+        x_min=crop_bbox[0],
+        x_max=crop_bbox[2],
+        y_min=crop_bbox[1],
+        y_max=crop_bbox[3],
+        p=1,
+    ),
+    dict(type="Resize", height=img_scale[1], width=img_scale[0], p=1),
     ]
 
-    dataset = CulaneDataset(
-        data_root=data_root,
-        data_list=list_path,
-        pipeline=test_pipeline,
-        diff_file=None,
-        test_mode=True,
-    )
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=collate_lanelm_batch,
-    )
-    return dataloader
+def extract_p5_feat(model, imgs: torch.Tensor):
+    """Extract P5 feature from frozen CLRerNet backbone."""
+    with torch.no_grad():
+        feats = model.extract_feat(imgs)
+        p5 = feats[-1]
+    return [p5]
 
 
-def autoregressive_decode_tokens(
+def collate_test_batch(batch):
+    """Collate function for test dataloader."""
+    imgs = torch.stack([torch.from_numpy(item["img"]).permute(2, 0, 1).float() / 255.0 for item in batch])
+    sub_img_names = [item.get("sub_img_name", item.get("filename", "unknown")) for item in batch]
+    return {"inputs": imgs, "sub_img_names": sub_img_names}
+
+
+def autoregressive_decode(
     lanelm_model,
-    visual_tokens: torch.Tensor,
-    num_points: int,
-    nbins_x: int,
-    temperature: float = 0.0,
-    max_lanes: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Greedy (or temperature) autoregressive decoding of LaneLM tokens.
-
-    Args:
-        lanelm_model: LaneLMModel in eval mode.
-        visual_tokens: (B, N, C) visual feature tokens from CLRerNet FPN.
-        num_points: Sequence length T used in training/tokenizer.
-        nbins_x: Vocabulary size for x tokens.
-        temperature: Sampling temperature; 0.0 = greedy argmax.
-
-    Returns:
-        x_tokens: (B, T) long tensor of x tokens.
-        y_tokens: (B, T) long tensor of y/time-step tokens (0..T-1).
-
-    Note:
-        - This implementation is intentionally simple and computes a full
-          forward pass for each time step. For T=40 this is acceptable.
-        - y tokens are fixed to [0..T-1] for all positions to mimic the
-          training setup where y encodes the step index.
-    """
+    visual_tokens,
+    num_points,
+    nbins_x,
+    max_lanes,
+    bos_token_ids,
+):
+    """Autoregressive decoding for LaneLM inference."""
     device = visual_tokens.device
     B = visual_tokens.shape[0]
     T = num_points
     pad_token_x = 0
-    pad_token_y = T  # EOS / padding for y
 
-    # We decode up to max_lanes per image by repeating the decoding process.
-    # Each lane has a fixed maximum length T, and we stop early when EOS
-    # (x=0 or y=T) is predicted.
     all_x = []
     all_y = []
 
     for lane_idx in range(max_lanes):
-        # Fixed y tokens encoding the step index [0..T-1].
-        y_tokens = torch.arange(T, device=device).unsqueeze(0).expand(B, -1).clone()
-
-        # Initialize all x tokens as padding.
-        x_tokens = torch.full(
-            (B, T),
-            pad_token_x,
-            dtype=torch.long,
-            device=device,
-        )
-
-        # Autoregressive decoding with EOS criterion.
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        lane_id_tensor = torch.full((B,), lane_idx, dtype=torch.long, device=device)
+        current_bos = bos_token_ids[lane_idx]
+        
+        x_out = torch.full((B, T), pad_token_x, dtype=torch.long, device=device)
+        y_out = torch.full((B, T), 0, dtype=torch.long, device=device)
+        
+        x_in = torch.full((B, T), pad_token_x, dtype=torch.long, device=device)
+        x_in[:, 0] = current_bos
+        y_in = torch.full((B, T), 0, dtype=torch.long, device=device)
 
         for t in range(T):
             logits_x, logits_y = lanelm_model(
-                visual_tokens=visual_tokens,
-                x_tokens=x_tokens,
-                y_tokens=y_tokens,
-                visual_padding_mask=None,
+                visual_tokens, 
+                x_in, 
+                y_in, 
+                None,  # visual_padding_mask
+                lane_id_tensor  # lane_indices
             )
-            step_logits_x = logits_x[:, t, :]  # (B, nbins_x)
-            step_logits_y = logits_y[:, t, :]  # (B, max_y_tokens)
+            
+            # Greedy X (mask BOS tokens)
+            step_logits_x = logits_x[:, t, :]
+            for bid in bos_token_ids:
+                step_logits_x[:, bid] = -float('inf')
+            pred_x = torch.argmax(step_logits_x, dim=-1)
+            
+            # Greedy Y
+            step_logits_y = logits_y[:, t, :]
+            pred_y = torch.argmax(step_logits_y, dim=-1)
+            
+            # Clamp to valid ranges
+            pred_x = pred_x.clamp(0, nbins_x - 1)
+            pred_y = pred_y.clamp(0, T)  # max_y_tokens = T + 1
+            
+            x_out[:, t] = pred_x
+            y_out[:, t] = pred_y
+            
+            if t + 1 < T:
+                x_in[:, t+1] = pred_x
+                y_in[:, t+1] = pred_y
+        
+        all_x.append(x_out.cpu())
+        all_y.append(y_out.cpu())
 
-            if temperature and temperature > 0.0:
-                probs_x = torch.softmax(step_logits_x / temperature, dim=-1)
-                x_next = torch.multinomial(probs_x, num_samples=1).squeeze(1)
-                probs_y = torch.softmax(step_logits_y / temperature, dim=-1)
-                y_next = torch.multinomial(probs_y, num_samples=1).squeeze(1)
-            else:
-                x_next = torch.argmax(step_logits_x, dim=-1)
-                y_next = torch.argmax(step_logits_y, dim=-1)
-
-            # If EOS has not been reached yet, update tokens; otherwise keep padding.
-            still_running = ~finished
-            x_tokens[still_running, t] = x_next[still_running]
-            y_tokens[still_running, t] = y_next[still_running]
-
-            # EOS condition: x==0 or y==T
-            is_eos = (x_next == pad_token_x) | (y_next == pad_token_y)
-            finished = finished | is_eos
-
-            # Early break if all sequences finished
-            if torch.all(finished):
-                break
-
-        all_x.append(x_tokens.cpu())
-        all_y.append(y_tokens.cpu())
-
-    # Stack over lane dimension: (B, L, T)
-    x_tokens_all = torch.stack(all_x, dim=1)
-    y_tokens_all = torch.stack(all_y, dim=1)
-    return x_tokens_all, y_tokens_all
+    return torch.stack(all_x, dim=1), torch.stack(all_y, dim=1)
 
 
-def coords_to_lane(
-    coords_resized: np.ndarray,
-    ori_img_w: int,
-    ori_img_h: int,
-    crop_bbox: Tuple[int, int, int, int],
-    img_w: int,
-    img_h: int,
-) -> Lane:
-    """Map coordinates from cropped+resized space back to original CULane space.
+def hallucination_removal(lane_points, width=800):
+    """Apply Hallucination Removal (HR) from LaneLM paper (Alg. 1)."""
+    if len(lane_points) <= 10:
+        return lane_points
+    
+    points = np.array(lane_points)
+    x = points[:, 0]
+    
+    # Calculate absolute differences between adjacent x-coordinates
+    diff = np.abs(x[1:] - x[:-1])
+    
+    # Threshold: 2 * 85th percentile of diffs
+    theta = 2 * np.percentile(diff, 85)
+    
+    # Find first point where diff exceeds theta
+    # "p <- argmin(diff > theta)" means the first index where condition is true
+    exceeds = np.where(diff > theta)[0]
+    if len(exceeds) > 0:
+        p = exceeds[0]
+        # Truncate lane at p+1 (keep up to p, inclusive of the jump start?)
+        # Paper says: "points with offsets ... exceeding ... along with their subsequent points, will be filtered out."
+        # So we keep up to p.
+        return lane_points[:p+1]
+        
+    return lane_points
 
-    Args:
-        coords_resized: (M, 2) array in the 800x320 (img_w x img_h) space used by LaneLM.
-        ori_img_w: Original image width (e.g., 1640).
-        ori_img_h: Original image height (e.g., 590).
-        crop_bbox: (x_min, y_min, x_max, y_max) used in dataset pipeline.
-        img_w: Width after resizing (e.g., 800).
-        img_h: Height after resizing (e.g., 320).
 
-    Returns:
-        Lane instance whose internal points are normalized to [0, 1] in both axes,
-        compatible with CULaneMetric.
+def tokens_to_culane_format(x_tokens, y_tokens, tokenizer, ori_img_h=590, ori_img_w=1640, crop_y=270, smooth=True):
+    """Convert LaneLM tokens to CULane format (list of (x, y) tuples).
+    
+    The model operates on resized images (800x320) after cropping.
+    We need to:
+    1. Decode tokens to resized coordinates (0-800, 0-320)
+    2. Scale X: 800 -> 1640 (original width)
+    3. Scale Y: 320 -> 320 (crop height is same) then add crop_y offset
     """
-    if coords_resized.size == 0:
-        return Lane(points=np.zeros((0, 2), dtype=np.float32))
+    # Decode tokens to resized image coordinates
+    coords_resized = tokenizer.decode_single_lane(x_tokens, y_tokens, smooth=smooth)
+    
+    if coords_resized.shape[0] < 2:
+        return []
+    
+    # Scale factors
+    # Model trained on 800x320 crop, original is 1640x590 with crop at y=270
+    scale_x = ori_img_w / tokenizer.cfg.img_w  # 1640 / 800 = 2.05
+    crop_height = ori_img_h - crop_y  # 590 - 270 = 320
+    scale_y = crop_height / tokenizer.cfg.img_h  # 320 / 320 = 1.0
+    
+    lane_points = []
+    for i in range(coords_resized.shape[0]):
+        x = coords_resized[i, 0] * scale_x
+        y = coords_resized[i, 1] * scale_y + crop_y  # Add crop offset
+        
+        # Clip to valid image bounds
+        if x < 0 or x > ori_img_w:
+            continue  # Skip invalid points
+        if y < crop_y or y > ori_img_h:
+            continue  # Skip invalid points
+            
+        lane_points.append((x, y))
+    
+    return lane_points
 
-    xs = coords_resized[:, 0]
-    ys = coords_resized[:, 1]
 
-    x_min, y_min, x_max, y_max = crop_bbox
-
-    # In the current config: x is resized from [0, ori_w) -> [0, img_w),
-    # y is cropped to [y_min, y_max) then resized to [0, img_h).
-    # Invert this mapping.
-    x_scale = float(ori_img_w) / float(img_w)
-    y_scale = float(y_max - y_min) / float(img_h)
-
-    x_orig = xs * x_scale
-    y_orig = ys * y_scale + float(y_min)
-
-    x_norm = x_orig / float(ori_img_w)
-    y_norm = y_orig / float(ori_img_h)
-
-    points = np.stack([x_norm, y_norm], axis=1).astype(np.float32)
-    return Lane(points=points)
+def get_prediction_string(lanes):
+    """Convert lanes to CULane prediction string format."""
+    out_lines = []
+    for lane in lanes:
+        if len(lane) < 2:
+            continue
+        lane_str = " ".join([f"{x:.5f} {y:.5f}" for x, y in lane])
+        out_lines.append(lane_str)
+    return "\n".join(out_lines)
 
 
-def main() -> None:
-    args = parse_args()
+def main():
+    parser = argparse.ArgumentParser(description="Test LaneLM on CULane dataset")
+    parser.add_argument("--config", default="configs/clrernet/culane/clrernet_culane_dla34_ema.py",
+                        help="CLRerNet config file for backbone")
+    parser.add_argument("--backbone-checkpoint", default="clrernet_culane_dla34_ema.pth",
+                        help="CLRerNet checkpoint for frozen backbone")
+    parser.add_argument("--checkpoint", required=True,
+                        help="LaneLM checkpoint to test")
+    parser.add_argument("--data-root", default="dataset/culane",
+                        help="CULane dataset root")
+    parser.add_argument("--list-path", default="dataset/culane/list/test.txt",
+                        help="Test list file")
+    parser.add_argument("--work-dir", default="work_dirs/lanelm_test",
+                        help="Output directory for predictions and results")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Test batch size")
+    parser.add_argument("--device", default="cuda",
+                        help="Device to use")
+    args = parser.parse_args()
 
-    cfg = Config.fromfile(args.config)
-
-    if args.work_dir is not None:
-        os.makedirs(args.work_dir, exist_ok=True)
-
-    device = torch.device(
-        args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
-    )
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Test configuration (original image size and crop).
-    test_cfg = cfg.model.get("test_cfg", {})
-    ori_img_w = int(test_cfg.get("ori_img_w", 1640))
-    ori_img_h = int(test_cfg.get("ori_img_h", 590))
-    cut_height = int(test_cfg.get("cut_height", 270))
+    # Create output directories
+    pred_dir = os.path.join(args.work_dir, "predictions")
+    os.makedirs(pred_dir, exist_ok=True)
 
-    # Dataset geometry (LaneLM operates in this resized space).
-    from configs.clrernet.culane.dataset_culane_clrernet import (  # type: ignore
-        crop_bbox,
-        img_scale,
+    # Model hyperparameters (must match training)
+    nbins_x = 200 
+    max_abs_dx = 32 
+    total_vocab_size = 300
+    # V4 uses lane_indices instead of BOS tokens, so use 0 (padding) as start
+    bos_token_ids = [0, 0, 0, 0]  # No explicit BOS for absolute tokenization
+    max_lanes = 4
+
+    hparams = LaneLMHyperParams(
+        nbins_x=total_vocab_size, 
+        num_points=40,
+        embed_dim=256,
+        num_layers=4,
+        max_lanes=max_lanes, 
     )
 
-    img_w, img_h = img_scale  # e.g., (800, 320)
-
-    # Load LaneLM checkpoint and config.
-    ckpt = torch.load(args.lanelm_checkpoint, map_location="cpu")
-    lm_cfg = ckpt.get("config", {})
-    num_points = int(lm_cfg.get("num_points", 40))
-    nbins_x = int(lm_cfg.get("nbins_x", 800))
-    embed_dim = int(lm_cfg.get("embed_dim", 256))
-    num_layers = int(lm_cfg.get("num_layers", 4))
-    num_heads = int(lm_cfg.get("num_heads", 8))
-    ffn_dim = int(lm_cfg.get("ffn_dim", 512))
-
-    print(
-        f"Loaded LaneLM checkpoint '{args.lanelm_checkpoint}' "
-        f"with config: num_points={num_points}, nbins_x={nbins_x}, "
-        f"embed_dim={embed_dim}, num_layers={num_layers}, "
-        f"num_heads={num_heads}, ffn_dim={ffn_dim}"
-    )
-
-    # DataLoader for CULane test split with LaneLM-style preprocessing.
-    max_lanes = 4  # must match training pipeline
-    test_loader = build_culane_lanelm_test_dataloader(
-        data_root=args.data_root,
-        list_path=args.test_list,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        img_w=img_w,
-        img_h=img_h,
-        max_lanes=max_lanes,
-        num_points=num_points,
-        nbins_x=nbins_x,
-    )
-
-    # Frozen CLRerNet feature extractor (same as in training).
-    clrernet_model = build_frozen_clrernet(
-        config_path=args.config,
-        checkpoint_path=args.clrernet_checkpoint,
-        device=device,
-    )
-
-    # Visual feature dimension (FPN out_channels).
-    visual_in_dim = getattr(clrernet_model.neck, "out_channels", embed_dim)
-
-    # LaneLM head and tokenizer.
-    lanelm_model = build_lanelm_model(
-        nbins_x=nbins_x,
-        num_points=num_points,
-        visual_in_dim=visual_in_dim,
-        embed_dim=embed_dim,
-        num_layers=num_layers,
-        num_heads=num_heads,
-        ffn_dim=ffn_dim,
-    )
-    lanelm_model.load_state_dict(ckpt["model_state_dict"])
-    lanelm_model.to(device)
-    lanelm_model.eval()
-
+    # Build tokenizer
     tokenizer_cfg = LaneTokenizerConfig(
-        img_w=img_w,
-        img_h=img_h,
-        num_steps=num_points,
+        img_w=hparams.img_w, 
+        img_h=hparams.img_h,
+        num_steps=hparams.num_points, 
         nbins_x=nbins_x,
+        x_mode="relative_disjoint", 
+        max_abs_dx=max_abs_dx
     )
     tokenizer = LaneTokenizer(tokenizer_cfg)
+    
+    # Build models
+    print("Loading CLRerNet backbone...")
+    clrernet = build_frozen_clrernet_backbone(args.config, args.backbone_checkpoint, device)
+    
+    print("Loading LaneLM model...")
+    lanelm = build_lanelm_model_v3(hparams, visual_in_channels=(64,)).to(device)
+    
+    # Load checkpoint
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    
+    # Try to load config from checkpoint
+    if "config" in ckpt:
+        print("Found config in checkpoint, overriding defaults...")
+        saved_cfg = ckpt["config"]
+        # Update hparams from saved config
+        if "nbins_x" in saved_cfg: nbins_x = saved_cfg["nbins_x"]
+        if "num_points" in saved_cfg: hparams.num_points = saved_cfg["num_points"]
+        if "embed_dim" in saved_cfg: hparams.embed_dim = saved_cfg["embed_dim"]
+        if "num_layers" in saved_cfg: hparams.num_layers = saved_cfg["num_layers"]
+        if "max_lanes" in saved_cfg: max_lanes = saved_cfg["max_lanes"]
+        
+        # Update hparams object
+        hparams.nbins_x = nbins_x
+        hparams.max_lanes = max_lanes
+        
+        print(f"Loaded config: nbins_x={nbins_x}, num_points={hparams.num_points}, embed_dim={hparams.embed_dim}")
+    else:
+        print("WARNING: No config found in checkpoint, using hardcoded defaults (nbins_x=200).")
+        print("If your model was trained with nbins_x=800, this will cause zigzagging!")
 
-    # CULane metric instance (same evaluation logic as CLRerNet).
-    metric = CULaneMetric(
-        data_root=args.data_root,
-        data_list=args.test_list,
+    # Re-build tokenizer with potentially updated config
+    tokenizer_cfg = LaneTokenizerConfig(
+        img_w=hparams.img_w, 
+        img_h=hparams.img_h,
+        num_steps=hparams.num_points, 
+        nbins_x=nbins_x,
+        x_mode="relative_disjoint" if nbins_x < 300 else "absolute", # Heuristic: small nbins usually means relative
+        max_abs_dx=max_abs_dx
     )
+    # Override x_mode if it was absolute in training (usually nbins_x=800 is absolute)
+    if nbins_x == 800:
+        tokenizer_cfg.x_mode = "absolute"
+        
+    tokenizer = LaneTokenizer(tokenizer_cfg)
 
-    all_results: List[dict] = []
+    # Re-build model with updated hparams
+    # Check if checkpoint has Full FPN (v4) or single channel (v3)
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    if "visual_encoder.proj_per_level.1.weight" in state_dict:
+        # V4 model with Full FPN
+        print("Detected V4 model (Full FPN)")
+        visual_in_channels = (64, 64, 64)
+    else:
+        # V3 model with single channel
+        visual_in_channels = (64,)
+    
+    # Get max_seq_len from checkpoint
+    pos_emb_shape = state_dict.get("keypoint_embed.pos_embedding.weight", None)
+    max_seq_len = pos_emb_shape.shape[0] if pos_emb_shape is not None else hparams.num_points
+    print(f"Using max_seq_len={max_seq_len}")
+    
+    max_y_tokens = hparams.num_points + 1
+    lanelm = LaneLMModel(
+        nbins_x=nbins_x,
+        max_y_tokens=max_y_tokens,
+        embed_dim=hparams.embed_dim,
+        num_layers=hparams.num_layers,
+        num_heads=hparams.num_heads,
+        ffn_dim=hparams.ffn_dim,
+        max_seq_len=max_seq_len,
+        visual_in_channels=visual_in_channels,
+    ).to(device)
 
-    print("Starting LaneLM inference on CULane test set...")
+    if "model_state_dict" in ckpt:
+        lanelm.load_state_dict(ckpt["model_state_dict"])
+    else:
+        lanelm.load_state_dict(ckpt)
+    lanelm.eval()
+    print(f"Loaded LaneLM checkpoint from {args.checkpoint}")
+    
+    # Build test dataloader
+    print("Loading test dataset...")
+    pipeline = [dict(type="albumentation", pipelines=test_pipeline)]
+    test_dataset = CulaneDataset(
+        data_root=args.data_root,
+        data_list=args.list_path,
+        pipeline=pipeline,
+        diff_file=None,
+        test_mode=True,
+    )
+    print(f"Test dataset size: {len(test_dataset)}")
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_test_batch,
+    )
+    
+    # Run inference
+    print("Running inference...")
     with torch.no_grad():
-        for batch_idx, batch in enumerate(test_loader):
-            imgs = batch["inputs"].to(device, non_blocking=True)
-            metas = batch["metainfo"]  # list of dicts
+        for batch in tqdm(test_loader, desc="Testing"):
+            imgs = batch["inputs"].to(device)
+            sub_img_names = batch["sub_img_names"]
 
-            B = imgs.shape[0]
+            # Extract visual features
+            if len(visual_in_channels) == 3:
+                # Full FPN (V4)
+                with torch.no_grad():
+                    feats = clrernet.extract_feat(imgs)
+            else:
+                # P5 only (V3)
+                feats = extract_p5_feat(clrernet, imgs)
+            visual_tokens = lanelm.encode_visual_tokens(feats)
 
-            # Extract visual tokens from frozen CLRerNet.
-            visual_tokens_per_img = extract_visual_tokens(clrernet_model, imgs)
-
-            # Decode up to max_lanes sequences per image with EOS.
-            x_tokens_all, y_tokens_all = autoregressive_decode_tokens(
-                lanelm_model=lanelm_model,
-                visual_tokens=visual_tokens_per_img,
-                num_points=num_points,
-                nbins_x=nbins_x,
-                temperature=args.temperature,
-                max_lanes=1,
+            # Decode lanes
+            x_tokens_all, y_tokens_all = autoregressive_decode(
+                lanelm_model=lanelm,
+                visual_tokens=visual_tokens,
+                num_points=tokenizer.cfg.num_steps,
+                nbins_x=lanelm.nbins_x,
+                max_lanes=max_lanes,
+                bos_token_ids=bos_token_ids,
             )
 
-            x_tokens_np = x_tokens_all.cpu().numpy()  # (B, L, T)
-            y_tokens_np = y_tokens_all.cpu().numpy()  # (B, L, T)
-
-            for i in range(B):
-                lanes: List[Lane] = []
-                # Iterate over decoded lanes for this image
-                for l in range(x_tokens_np.shape[1]):
-                    xt = x_tokens_np[i, l]
-                    yt = y_tokens_np[i, l]
-
-                    # Decode tokens into 800x320 coordinate space.
-                    coords_resized = tokenizer.decode_single_lane(xt, yt)
-                    if coords_resized.shape[0] == 0:
-                        continue
-
-                    lane = coords_to_lane(
-                        coords_resized=coords_resized,
-                        ori_img_w=ori_img_w,
-                        ori_img_h=ori_img_h,
-                        crop_bbox=tuple(crop_bbox),
-                        img_w=img_w,
-                        img_h=img_h,
-                    )
-                    if lane.points.shape[0] > 0:
-                        lanes.append(lane)
-
-                sub_img_name = metas[i]["sub_img_name"]
-                all_results.append(
-                    {
-                        "lanes": lanes,
-                        "scores": np.ones(len(lanes), dtype=np.float32),
-                        "metainfo": {"sub_img_name": sub_img_name},
-                    }
-                )
-
-            if (batch_idx + 1) % 10 == 0:
-                print(
-                    f"Processed {batch_idx + 1}/{len(test_loader)} "
-                    f"batches ({(batch_idx + 1) * args.batch_size} images)..."
-                )
-
-    print("Finished inference. Running CULane evaluation...")
-    results = metric.compute_metrics(all_results)
-
-    print("CULane evaluation results (LaneLM head):")
-    for k in sorted(results.keys()):
-        v = results[k]
-        if isinstance(v, float):
-            print(f"{k}: {v:.6f}")
-        else:
-            print(f"{k}: {v}")
-
-    if args.work_dir is not None:
-        out_path = os.path.join(args.work_dir, "lanelm_culane_metrics.txt")
-        with open(out_path, "w") as f:
-            for k in sorted(results.keys()):
-                v = results[k]
-                if isinstance(v, float):
-                    f.write(f"{k}: {v:.6f}\n")
-                else:
-                    f.write(f"{k}: {v}\n")
-        print(f"Saved metrics to: {out_path}")
+            x_tokens_np = x_tokens_all.numpy()
+            y_tokens_np = y_tokens_all.numpy()
+            
+            # Save predictions
+            for i, sub_name in enumerate(sub_img_names):
+                lanes = []
+                for lane_idx in range(max_lanes):
+                    xt = x_tokens_np[i, lane_idx]
+                    yt = y_tokens_np[i, lane_idx]
+                    # Enable smoothing
+                    lane_pts = tokens_to_culane_format(xt, yt, tokenizer, smooth=True)
+                    
+                    # Apply Hallucination Removal
+                    lane_pts = hallucination_removal(lane_pts)
+                    
+                    if len(lane_pts) >= 2:
+                        lanes.append(lane_pts)
+                
+                # Save to prediction file
+                dst_path = Path(pred_dir) / Path(sub_name).with_suffix(".lines.txt")
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                with open(str(dst_path), "w") as f:
+                    output = get_prediction_string(lanes)
+                    if len(output) > 0:
+                        print(output, file=f)
+    
+    # Evaluate predictions
+    print("\nEvaluating predictions...")
+    categories_dir = os.path.join(args.data_root, "list/test_split")
+    
+    results = eval_predictions(
+        pred_dir=pred_dir,
+        anno_dir=args.data_root,
+        list_path=args.list_path,
+        categories_dir=categories_dir,
+        iou_thresholds=[0.1, 0.5, 0.75],
+        width=30,
+        use_parallel=True,
+    )
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("LaneLM CULane Evaluation Results")
+    print("="*60)
+    
+    for iou_thr in [0.1, 0.5, 0.75]:
+        print(f"\nIoU Threshold = {iou_thr}:")
+        if f"F1_{iou_thr}" in results:
+            print(f"  F1:        {results[f'F1_{iou_thr}']:.4f}")
+            print(f"  Precision: {results[f'Precision{iou_thr}']:.4f}")
+            print(f"  Recall:    {results[f'Recall{iou_thr}']:.4f}")
+    
+    # Save results to file
+    results_file = os.path.join(args.work_dir, "results.txt")
+    with open(results_file, "w") as f:
+        f.write("LaneLM CULane Evaluation Results\n")
+        f.write("="*60 + "\n")
+        for key, value in results.items():
+            f.write(f"{key}: {value}\n")
+    print(f"\nResults saved to {results_file}")
 
 
 if __name__ == "__main__":

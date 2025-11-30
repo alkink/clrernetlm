@@ -43,7 +43,7 @@ class CulaneDataset(Dataset):
         self.img_prefix = data_root
         self.test_mode = test_mode
         # read image list
-        self.diffs = np.load(diff_file)["data"] if diff_file is not None else []
+        self.diffs = np.load(diff_file)["data"] if diff_file else []
         self.diff_thr = diff_thr
         self.img_infos, self.annotations, self.mask_paths = self.parse_datalist(
             data_list
@@ -71,9 +71,13 @@ class CulaneDataset(Dataset):
         with open(data_list) as f:
             lines = f.readlines()
             for i, line in enumerate(lines):
+                line = line.strip()
+                if not line:
+                    # Skip empty lines gracefully
+                    continue
                 if len(self.diffs) > 0 and self.diffs[i] < self.diff_thr:
                     continue
-                img_paths = line.strip().split(" ")
+                img_paths = line.split(" ")
                 img_infos.append(img_paths[0].lstrip("/"))
                 if not self.test_mode:
                     anno_path = img_paths[0].replace(".jpg", ".lines.txt")

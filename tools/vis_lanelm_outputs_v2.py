@@ -236,6 +236,7 @@ def coords_to_lane_v2(
     crop_bbox: Tuple[int, int, int, int],
     img_w: int,
     img_h: int,
+    debug: bool = False,
 ) -> Lane:
     if coords_resized.size == 0:
         return Lane(points=np.zeros((0, 2), dtype=np.float32))
@@ -245,16 +246,45 @@ def coords_to_lane_v2(
 
     x_min, y_min, x_max, y_max = crop_bbox
 
+    if debug:
+        print(f"\n  coords_to_lane_v2 DEBUG:")
+        print(f"    Input coords: X=[{xs.min():.1f}, {xs.max():.1f}], Y=[{ys.min():.1f}, {ys.max():.1f}]")
+        print(f"    crop_bbox: x_min={x_min}, y_min={y_min}, x_max={x_max}, y_max={y_max}")
+        print(f"    ori_img: {ori_img_w}x{ori_img_h}, resized: {img_w}x{img_h}")
+
     x_scale = float(ori_img_w) / float(img_w)
     y_scale = float(y_max - y_min) / float(img_h)
+
+    if debug:
+        print(f"    x_scale={x_scale:.3f}, y_scale={y_scale:.3f}")
 
     x_orig = xs * x_scale
     y_orig = ys * y_scale + float(y_min)
 
+    if debug:
+        print(f"    After scale: X=[{x_orig.min():.1f}, {x_orig.max():.1f}], Y=[{y_orig.min():.1f}, {y_orig.max():.1f}]")
+
     x_norm = x_orig / float(ori_img_w)
     y_norm = y_orig / float(ori_img_h)
 
+    if debug:
+        print(f"    After normalize: X=[{x_norm.min():.3f}, {x_norm.max():.3f}], Y=[{y_norm.min():.3f}, {y_norm.max():.3f}]")
+
     points = np.stack([x_norm, y_norm], axis=1).astype(np.float32)
+
+    # Sort points by y coordinate (required by Lane spline fitting)
+    sort_idx = np.argsort(points[:, 1])
+    points = points[sort_idx]
+
+    # Remove duplicate y values (keep first occurrence) for strictly increasing y
+    # Lane spline requires y values to be strictly increasing
+    if len(points) > 1:
+        unique_mask = np.concatenate([[True], np.diff(points[:, 1]) > 1e-6])
+        points = points[unique_mask]
+
+    if len(points) < 2:
+        return Lane(points=np.zeros((0, 2), dtype=np.float32))
+
     return Lane(points=points)
 
 
@@ -273,13 +303,21 @@ def draw_lanes_on_image(
         cv2.polylines(img, [pts], isClosed=False, color=(0, 255, 0), thickness=2)
 
     # Draw predicted lanes in red
-    for lane in pred_lanes:
+    for lane_idx, lane in enumerate(pred_lanes):
         if lane.points is None or lane.points.shape[0] == 0:
             continue
         pts = lane.points.copy()
         pts[:, 0] *= w
         pts[:, 1] *= h
         pts = pts.astype(np.int32)
+
+        # DEBUG: First lane only
+        if lane_idx == 0 and "vis_00000" in out_path:
+            print(f"\n  Drawing lane {lane_idx}:")
+            print(f"    Original shape: {lane.points.shape}")
+            print(f"    Scaled points (first 5): {pts[:5].tolist()}")
+            print(f"    Image size: {w}x{h}")
+
         cv2.polylines(img, [pts], isClosed=False, color=(0, 0, 255), thickness=2)
 
     cv2.imwrite(out_path, img)
@@ -329,15 +367,42 @@ def main() -> None:
     num_heads = int(lm_cfg.get("num_heads", 8))
     ffn_dim = int(lm_cfg.get("ffn_dim", 512))
     ckpt_max_lanes = int(lm_cfg.get("max_lanes", 4))
+    per_lane = lm_cfg.get("per_lane", False)  # v3 uses per-lane training
 
-    max_lanes = min(args.max_lanes, ckpt_max_lanes)
-
+    # Model max_seq_len must match checkpoint (for positional embeddings)
+    # We can decode fewer lanes at inference time
     visual_in_channels = (64, 64, 64)
     max_y_tokens = num_points + 1
-    max_seq_len = num_points * max_lanes * 2
+
+    if per_lane:
+        # v3: per-lane training, sequence = single lane (T tokens)
+        max_seq_len = num_points
+        print(f"Using per-lane (v3) mode: max_seq_len={max_seq_len}")
+    else:
+        # v2: multi-lane concatenated (T * max_lanes tokens)
+        max_seq_len = num_points * ckpt_max_lanes
+        print(f"Using multi-lane (v2) mode: max_seq_len={max_seq_len}")
+
+    # How many lanes to actually decode (can be less than ckpt_max_lanes)
+    max_lanes_decode = min(args.max_lanes, ckpt_max_lanes)
+
+    # v3/v2 tokenizer mode (prefer ckpt config)
+    x_mode = lm_cfg.get("x_mode", "relative" if per_lane else "absolute")
+    max_abs_dx = lm_cfg.get("max_abs_dx", 64 if per_lane else None)
+    if max_abs_dx is None:
+        max_abs_dx = 64
+    print(f"Using tokenizer mode: x_mode={x_mode}, max_abs_dx={max_abs_dx}")
+
+    # Handle disjoint relative vocab expansion (must match training).
+    vocab_size_x = nbins_x
+    if x_mode == "relative_disjoint":
+        vocab_size_x = nbins_x + 2 * max_abs_dx + 1
+        print(f"Disjoint mode: vocab_size_x={vocab_size_x} (abs {nbins_x} + rel {2*max_abs_dx+1})")
+    else:
+        print(f"Overlapping/absolute mode: vocab_size_x={vocab_size_x}")
 
     lanelm_model = LaneLMModel(
-        nbins_x=nbins_x,
+        nbins_x=vocab_size_x,
         max_y_tokens=max_y_tokens,
         embed_dim=embed_dim,
         num_layers=num_layers,
@@ -355,7 +420,9 @@ def main() -> None:
         img_w=img_w,
         img_h=img_h,
         num_steps=num_points,
-        nbins_x=nbins_x,
+        nbins_x=nbins_x,  # tokenizer still needs original nbins for quant/dequant
+        x_mode=x_mode,
+        max_abs_dx=max_abs_dx,
     )
     tokenizer = LaneTokenizer(tokenizer_cfg)
 
@@ -390,13 +457,15 @@ def main() -> None:
         feats = extract_pyramid_feats(clrernet_model, img_tensor)
         visual_tokens = lanelm_model.encode_visual_tokens(feats)
 
-        # Decode lanes
+        # Decode lanes (works for both v2 and v3)
+        # v3 per-lane mode: each lane decoded independently
+        # v2 multi-lane mode: lanes decoded sequentially
         x_tokens_all, y_tokens_all = autoregressive_decode_tokens_v2(
             lanelm_model=lanelm_model,
             visual_tokens=visual_tokens,
             num_points=num_points,
-            nbins_x=nbins_x,
-            max_lanes=max_lanes,
+        nbins_x=vocab_size_x,
+            max_lanes=max_lanes_decode,
             temperature=args.temperature,
         )
 
@@ -412,6 +481,17 @@ def main() -> None:
             if coords_resized.shape[0] == 0:
                 continue
 
+            # DEBUG: Log decoded coordinates
+            if idx == 0 and l == 0:  # First image, first lane
+                print(f"\nDEBUG Lane {l}:")
+                print(f"  x_tokens (first 10): {xt[:10].tolist()}")
+                print(f"  y_tokens (first 10): {yt[:10].tolist()}")
+                print(f"  Decoded coords shape: {coords_resized.shape}")
+                if len(coords_resized) > 0:
+                    print(f"  X range: [{coords_resized[:, 0].min():.1f}, {coords_resized[:, 0].max():.1f}]")
+                    print(f"  Y range: [{coords_resized[:, 1].min():.1f}, {coords_resized[:, 1].max():.1f}]")
+                    print(f"  First 5 coords: {coords_resized[:5].tolist()}")
+
             lane = coords_to_lane_v2(
                 coords_resized=coords_resized,
                 ori_img_w=ori_img_w,
@@ -419,7 +499,17 @@ def main() -> None:
                 crop_bbox=tuple(crop_bbox),
                 img_w=img_w,
                 img_h=img_h,
+                debug=(idx == 0 and l == 0),  # Debug first image, first lane
             )
+
+            # DEBUG: Check transformed coordinates
+            if idx == 0 and l == 0 and lane.points.shape[0] > 0:
+                print(f"\n  After transform:")
+                print(f"    Normalized points shape: {lane.points.shape}")
+                print(f"    X range: [{lane.points[:, 0].min():.3f}, {lane.points[:, 0].max():.3f}]")
+                print(f"    Y range: [{lane.points[:, 1].min():.3f}, {lane.points[:, 1].max():.3f}]")
+                print(f"    First 5 points: {lane.points[:5].tolist()}")
+
             if lane.points.shape[0] > 0:
                 pred_lanes.append(lane)
 

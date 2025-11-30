@@ -87,7 +87,16 @@ def main():
         cfg.work_dir = osp.join('./work_dirs',
                                 osp.splitext(osp.basename(args.config))[0])
 
-    cfg.load_from = args.checkpoint
+    # Only set load_from if not explicitly disabled in config
+    # This allows models to handle their own checkpoint loading
+    config_load_from = cfg.get('load_from', 'use_checkpoint')
+    if config_load_from is None:
+        # Config explicitly sets load_from=None, respect it
+        # Model will handle its own checkpoint loading internally
+        pass
+    else:
+        # Use the checkpoint argument
+        cfg.load_from = args.checkpoint
 
     if args.show or args.show_dir:
         cfg = trigger_visualization_hook(cfg, args)

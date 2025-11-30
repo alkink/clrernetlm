@@ -28,13 +28,20 @@ from libs.utils.visualizer import draw_lane
 
 @METRICS.register_module()
 class CULaneMetric(BaseMetric):
-    def __init__(self, data_root, data_list, y_step=2):
+    def __init__(self, data_root, data_list, y_step=2, use_parallel=True, result_dir=None):
         self.img_prefix = data_root
         self.list_path = data_list
         self.test_categories_dir = str(Path(data_root).joinpath("list/test_split/"))
-        self.result_dir = tempfile.TemporaryDirectory().name
+        # Allow overriding result_dir to avoid tempdirs in restricted envs
+        if result_dir is None:
+            self._tempdir = tempfile.TemporaryDirectory()
+            self.result_dir = self._tempdir.name
+        else:
+            self.result_dir = result_dir
+            Path(self.result_dir).mkdir(parents=True, exist_ok=True)
         self.ori_w, self.ori_h = 1640, 590
         self.y_step = y_step
+        self.use_parallel = use_parallel
         super().__init__()
     
     def process(self, data_batch: dict, data_samples: Sequence[dict]) -> None:
@@ -75,6 +82,7 @@ class CULaneMetric(BaseMetric):
             self.list_path,
             self.test_categories_dir,
             logger=MMLogger.get_current_instance(),
+            use_parallel=self.use_parallel,
         )
         return results
 
@@ -89,14 +97,32 @@ class CULaneMetric(BaseMetric):
         ys = np.arange(0, self.ori_h, self.y_step) / self.ori_h
         out = []
         for lane in lanes:
-            xs = lane(ys)
+            # Only interpolate within lane's Y range to avoid extrapolation errors
+            # Lane's Y range is stored in min_y and max_y (with small margin)
+            lane_min_y = lane.min_y
+            lane_max_y = lane.max_y
+            
+            # Filter ys to only include values within lane's Y range
+            ys_in_range = ys[(ys >= lane_min_y) & (ys <= lane_max_y)]
+            
+            if len(ys_in_range) < 2:
+                continue
+            
+            # Interpolate only within valid Y range
+            xs = lane(ys_in_range)
+            
+            # Filter out invalid values (xs < 0 or xs >= 1)
             valid_mask = (xs >= 0) & (xs < 1)
             xs = xs * self.ori_w
             lane_xs = xs[valid_mask]
-            lane_ys = ys[valid_mask] * self.ori_h
-            lane_xs, lane_ys = lane_xs[::-1], lane_ys[::-1]
+            lane_ys = ys_in_range[valid_mask] * self.ori_h
+            
             if len(lane_xs) < 2:
                 continue
+            
+            # Reverse to match CULane format (bottom to top)
+            lane_xs, lane_ys = lane_xs[::-1], lane_ys[::-1]
+            
             lane_str = " ".join(
                 ["{:.5f} {:.5f}".format(x, y) for x, y in zip(lane_xs, lane_ys)]
             )
@@ -214,7 +240,7 @@ def load_culane_data(data_dir, file_list_path, data_cats):
     """
     with open(file_list_path, 'r') as file_list:
         data_paths = [
-            line[1 if line[0] == '/' else 0 :].rstrip()
+            line.split()[0][1 if line.split()[0][0] == '/' else 0 :]
             for line in file_list.readlines()
         ]
         cats = [
@@ -272,6 +298,7 @@ def eval_predictions(
     width=30,
     sequential=False,
     logger=None,
+    use_parallel=True,
 ):
     """
     Evaluate predictions on CULane dataset.
@@ -296,13 +323,13 @@ def eval_predictions(
     annotations, cats = load_culane_data(anno_dir, list_path, data_cats)  # (34680,)
     print_log(
         'Calculating metric {}...'.format(
-            'sequentially' if sequential else 'in parallel'
+            'sequentially' if (sequential or not use_parallel) else 'in parallel'
         ),
         logger=logger,
     )
     img_shape = (590, 1640, 3)
     eps = 1e-8
-    if sequential:
+    if sequential or (not use_parallel):
         results = t_map(
             partial(
                 culane_metric,

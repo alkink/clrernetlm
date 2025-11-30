@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "tools/vis_lanelm_mmdet.py", line 66, in main
+    result = inference_detector(model, img_path)
+  File "/home/alki/miniconda3/envs/clrernet/lib/python3.8/site-packages/mmdet/apis/inference.py", line 159, in inference_detector
+    test_pipeline = Compose(test_pipeline)
+  File "/home/alki/miniconda3/envs/clrernet/lib/python3.8/site-packages/mmcv/transforms/wrappers.py", line 66, in __init__
+    transform = TRANSFORMS.build(transform)
+  File "/home/alki/miniconda3/envs/clrernet/lib/python3.8/site-packages/mmengine/registry/registry.py", line 570, in build
+    return self.build_func(cfg, *args, **kwargs, registry=self)
+  File "/home/alki/miniconda3/envs/clrernet/lib/python3.8/site-packages/mmengine/registry/build_functions.py", line 100, in build_from_cfg
+    raise KeyError(
+KeyError: 'albumentation is not in the mmdet::transform registry. Please check whether the value of `albumentation` is correct or it was registered as expected. More details can be found at https://mmengine.readthedocs.io/en/latest/advanced_tutorials/config.html#import-the-custom-module'

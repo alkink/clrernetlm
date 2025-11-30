@@ -348,7 +348,8 @@ def main() -> None:
     # LaneLM v2 head.
     visual_in_channels = (64, 64, 64)
     max_y_tokens = num_points + 1
-    max_seq_len = num_points * max_lanes * 2
+    # Sequence length = T * max_lanes (no extra factor)
+    max_seq_len = num_points * max_lanes
 
     lanelm_model = LaneLMModel(
         nbins_x=nbins_x,

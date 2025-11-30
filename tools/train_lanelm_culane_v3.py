@@ -1,16 +1,18 @@
 """
-LaneLM v2 training script on CULane, closely following the LaneLM paper.
+LaneLM v3 training script on CULane (per-lane training).
 
-Key points:
-  - Uses CLRerNet backbone + FPN as frozen visual encoder (teacher feature extractor).
-  - Uses GT lane polylines as supervision and (optionally) as pseudo labels.
-  - Encodes lanes into LaneLM-style token sequences (x_t, y_t) with LaneTokenizer.
-  - Builds multi-lane sequences per image and trains a decoder-only LM with
-    cross-entropy over x and y tokens (Eq. 11 in the paper).
+Farkı ne?
+  - v2'de her görüntüdeki lane'ler tek uzun sequence olarak concat ediliyordu
+    (L1; L2; ...; LN). Inference'te ise lane başına ayrı decode yapıyoruz.
+    Bu training/inference dağılımını uyumsuz hale getiriyordu.
+  - v3'te her lane bağımsız bir sequence (B*L, T) olarak ele alınıyor.
+    Yani model p(L | X_v) her lane için ayrı ayrı öğreniyor; train ve test
+    formu bire bir aynı.
 
-This script is designed to be modular and faithful to the algorithmic
-description in the LaneLM preprint, but does not attempt to reproduce all
-engineering tricks (e.g., advanced KV caching) inside this file.
+Bu script özellikle:
+  - Küçük overfit deneyleri (1–2 görüntü) için,
+  - LaneLM'in geometriyi prensipte öğrenip öğrenemediğini test etmek için
+tasarlanmıştır.
 """
 
 import argparse
@@ -33,10 +35,11 @@ from libs.models.lanelm import LaneLMModel, LaneTokenizer, LaneTokenizerConfig
 
 @dataclass
 class LaneLMHyperParams:
-    """Hyper-parameters mirroring the LaneLM paper."""
+    """Hyper-parameters for LaneLM v3 (per-lane training)."""
 
     num_points: int = 40  # T
-    nbins_x: int = 800
+    # Daha kolay öğrenilebilir hale getirmek için x vocab küçültüldü.
+    nbins_x: int = 200
     max_lanes: int = 4
     img_w: int = 800
     img_h: int = 320
@@ -44,20 +47,11 @@ class LaneLMHyperParams:
     num_layers: int = 4
     num_heads: int = 8
     ffn_dim: int = 512
+    dropout: float = 0.0  # Dropout rate for regularization
 
 
-def collate_lanelm_batch_v2(batch):
-    """Custom collate function to keep per-image GT lanes.
-
-    Each item from CulaneDataset + Alaug + raw dict pipeline is expected to
-    contain:
-      - 'img': numpy array (H, W, 3)
-      - 'gt_points': list of lanes, each as flat [x0, y0, x1, y1, ...]
-      - 'sub_img_name': relative path used by CULaneMetric (for later tests)
-      - 'ori_shape', 'img_shape': tuples
-
-    We keep gt_points as a Python list per image to allow flexible tokenization.
-    """
+def collate_lanelm_batch_v3(batch):
+    """Custom collate function to keep per-image GT lanes."""
     imgs = [item["img"] for item in batch]
     gt_points = [item.get("gt_points", []) for item in batch]
     sub_img_names = [item.get("sub_img_name") for item in batch]
@@ -82,7 +76,7 @@ def collate_lanelm_batch_v2(batch):
     }
 
 
-def build_culane_lanelm_dataloader_v2(
+def build_culane_lanelm_dataloader_v3(
     data_root: str,
     list_path: str,
     diff_file: str,
@@ -90,23 +84,27 @@ def build_culane_lanelm_dataloader_v2(
     num_workers: int,
     img_w: int,
     img_h: int,
+    no_aug: bool = False,
 ) -> DataLoader:
-    """CULane DataLoader for LaneLM v2 with GT lane polylines.
+    """CULane DataLoader for LaneLM v3 (per-lane training).
 
-    We reuse the CULane augmentation pipeline (train_al_pipeline) from the
-    CLRerNet dataset config, but we stop before PackCLRNetInputs and keep
-    gt_points in the raw format for tokenization in this script.
+    If no_aug=True, uses the validation pipeline (Crop+Resize, no random
+    augmentations). This is intended for overfit/debug runs where we want
+    the training distribution to match the visualization/test pipeline.
+    Otherwise, uses the full train_al_pipeline with augmentations.
     """
     from configs.clrernet.culane.dataset_culane_clrernet import (  # type: ignore
-        compose_cfg,
-        crop_bbox,
-        img_scale,
         train_al_pipeline,
+        val_al_pipeline,
     )
 
-    # Albumentations pipeline (crop + resize + aug), no PackCLRNetInputs
+    if no_aug:
+        pipelines = val_al_pipeline
+    else:
+        pipelines = train_al_pipeline
+
     train_pipeline = [
-        dict(type="albumentation", pipelines=train_al_pipeline),
+        dict(type="albumentation", pipelines=pipelines),
     ]
 
     # diff_file is optional; fall back to None if not found
@@ -129,7 +127,7 @@ def build_culane_lanelm_dataloader_v2(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        collate_fn=collate_lanelm_batch_v2,
+        collate_fn=collate_lanelm_batch_v3,
     )
     return dataloader
 
@@ -158,28 +156,22 @@ def build_frozen_clrernet_backbone(
 
 
 def extract_pyramid_feats(model, imgs: torch.Tensor):
-    """Extract FPN features {F0, F1, F2} from CLRerNet backbone + neck.
-
-    Args:
-        model: pretrained CLRerNet detector.
-        imgs: (B, 3, H, W) tensor.
-    Returns:
-        feats: list of tensors [F0, F1, F2], each (B, C, H_i, W_i).
-    """
+    """Extract FPN features {F0, F1, F2} from CLRerNet backbone + neck."""
     with torch.no_grad():
         feats = model.extract_feat(imgs)
-    # CLRerNetFPN returns 3 levels, we keep all.
     return list(feats)
 
 
-def build_lanelm_model_v2(
+def build_lanelm_model_v3(
     hparams: LaneLMHyperParams,
     visual_in_channels: Tuple[int, int, int],
 ) -> LaneLMModel:
-    """Construct a LaneLMModel consistent with the paper hyperparams."""
+    """Construct LaneLMModel for per-lane training.
+
+    Sequence length = num_points (T); her lane tek bir sequence.
+    """
     max_y_tokens = hparams.num_points + 1  # including padding/EOS
-    # Sequence length = T * max_lanes (no extra factor)
-    max_seq_len = hparams.num_points * hparams.max_lanes
+    max_seq_len = hparams.num_points
     model = LaneLMModel(
         nbins_x=hparams.nbins_x,
         max_y_tokens=max_y_tokens,
@@ -194,79 +186,20 @@ def build_lanelm_model_v2(
     return model
 
 
-def build_sequences_for_image(
-    lanes_points: List[List[float]],
-    tokenizer: LaneTokenizer,
-    hparams: LaneLMHyperParams,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build a multi-lane, multi-turn token sequence for one image.
-
-    For now we approximate the (L_q, L_gt) pairs in the paper by using GT
-    lanes both as "pseudo label" and target, i.e., L_q == L_gt. This still
-    trains LaneLM as a conditional language model p(L | X_v).
-
-    We:
-      - take up to max_lanes GT lanes,
-      - encode each lane to (x_tokens, y_tokens) of length T,
-      - build a long sequence [L1; L2; ...; LN],
-      - pad to max_seq_len if needed.
-    """
-    max_lanes = hparams.max_lanes
-    T = tokenizer.T  # num_steps
-
-    # Filter out degenerate lanes (< 2 points)
-    lanes_points = [
-        coords for coords in lanes_points if len(coords) >= 4
-    ]
-    lanes_points = lanes_points[:max_lanes]
-
-    x_seqs: List[np.ndarray] = []
-    y_seqs: List[np.ndarray] = []
-
-    for lane in lanes_points:
-        pts = np.array(lane, dtype=np.float32).reshape(-1, 2)
-        xt, yt = tokenizer.encode_single_lane(pts)
-        x_seqs.append(xt)
-        y_seqs.append(yt)
-
-    if not x_seqs:
-        # No valid lanes: return an all-padding sequence of length T.
-        x_tokens = np.full((T,), tokenizer.cfg.pad_token_x, dtype=np.int64)
-        y_tokens = np.full((T,), tokenizer.T, dtype=np.int64)
-    else:
-        # Concatenate lanes along sequence dimension: [L1; L2; ...]
-        x_tokens = np.concatenate(x_seqs, axis=0)  # (L*T,)
-        y_tokens = np.concatenate(y_seqs, axis=0)  # (L*T,)
-
-    max_seq_len = hparams.num_points * hparams.max_lanes  # Fixed: removed *2
-    # Truncate if longer than model max_seq_len
-    x_tokens = x_tokens[:max_seq_len]
-    y_tokens = y_tokens[:max_seq_len]
-
-    # Pad to max_seq_len
-    if x_tokens.shape[0] < max_seq_len:
-        pad_len = max_seq_len - x_tokens.shape[0]
-        x_pad = np.full(
-            (pad_len,), tokenizer.cfg.pad_token_x, dtype=np.int64
-        )
-        y_pad = np.full((pad_len,), tokenizer.T, dtype=np.int64)
-        x_tokens = np.concatenate([x_tokens, x_pad], axis=0)
-        y_tokens = np.concatenate([y_tokens, y_pad], axis=0)
-
-    x_tokens_t = torch.from_numpy(x_tokens).long()
-    y_tokens_t = torch.from_numpy(y_tokens).long()
-    return x_tokens_t, y_tokens_t
-
-
-def lane_lm_loss_v2(
+def lane_lm_loss_v3(
     logits_x: torch.Tensor,
     logits_y: torch.Tensor,
     target_x: torch.Tensor,
     target_y: torch.Tensor,
     pad_token_x: int,
     pad_token_y: int,
+    y_loss_weight: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Cross-entropy loss over x and y tokens with padding ignored."""
+    """Cross-entropy loss over x and y tokens with padding ignored.
+
+    y_loss_weight can be set to 0.0 for debug runs where we want to
+    focus purely on the x-coordinate modeling.
+    """
     B, T, nbins_x = logits_x.shape
     _, _, max_y_tokens = logits_y.shape
 
@@ -281,11 +214,11 @@ def lane_lm_loss_v2(
         logits_y.view(B * T, max_y_tokens),
         target_y.view(B * T),
     )
-    loss = 0.5 * (loss_x + loss_y)
+    loss = 0.5 * (loss_x + y_loss_weight * loss_y)
     return loss, loss_x, loss_y
 
 
-def train_one_epoch_v2(
+def train_one_epoch_v3(
     epoch: int,
     clrernet_model,
     lanelm_model: LaneLMModel,
@@ -294,10 +227,11 @@ def train_one_epoch_v2(
     device: torch.device,
     tokenizer: LaneTokenizer,
     hparams: LaneLMHyperParams,
-    log_interval: int = 50,
+    log_interval: int = 10,
+    y_loss_weight: float = 1.0,
     loss_log_path: str = "",
 ) -> None:
-    """Train LaneLM v2 for a single epoch."""
+    """Train LaneLM v3 (per-lane) for a single epoch."""
     lanelm_model.train()
 
     pad_token_x = tokenizer.cfg.pad_token_x
@@ -315,30 +249,71 @@ def train_one_epoch_v2(
 
         B = imgs.shape[0]
 
-        # Extract multi-level FPN features
+        # Visual tokens per image
         feats = extract_pyramid_feats(clrernet_model, imgs)
-        visual_tokens = lanelm_model.encode_visual_tokens(feats)
+        visual_tokens_imgs = lanelm_model.encode_visual_tokens(feats)
 
-        # Build token sequences per image
-        x_list: List[torch.Tensor] = []
-        y_list: List[torch.Tensor] = []
-        for lanes_points in batch_gt_points:
-            x_t, y_t = build_sequences_for_image(
-                lanes_points=lanes_points,
-                tokenizer=tokenizer,
-                hparams=hparams,
-            )
-            x_list.append(x_t)
-            y_list.append(y_t)
+        # Flatten lanes across batch: each lane becomes one sequence.
+        lane_visual_tokens: List[torch.Tensor] = []
+        lane_x_list: List[torch.Tensor] = []
+        lane_y_list: List[torch.Tensor] = []
 
-        x_tokens = torch.stack(x_list).to(device, non_blocking=True)
-        y_tokens = torch.stack(y_list).to(device, non_blocking=True)
+        for img_idx, lanes_points in enumerate(batch_gt_points):
+            lanes_points = [
+                coords for coords in lanes_points if len(coords) >= 4
+            ]
+            # Limit to max_lanes per image
+            lanes_points = lanes_points[: hparams.max_lanes]
 
-        # Teacher forcing: shift by one token
+            for lane_idx, lane in enumerate(lanes_points):
+                pts = np.array(lane, dtype=np.float32).reshape(-1, 2)
+
+                # DEBUG: Check if points are in valid range
+                if step == 0 and img_idx == 0 and lane_idx == 0:
+                    print(f"\nDEBUG: First GT lane points")
+                    print(f"  Points shape: {pts.shape}")
+                    print(f"  X range: [{pts[:, 0].min():.1f}, {pts[:, 0].max():.1f}]")
+                    print(f"  Y range: [{pts[:, 1].min():.1f}, {pts[:, 1].max():.1f}]")
+                    print(f"  First 3 points: {pts[:3].tolist()}")
+
+                x_np, y_np = tokenizer.encode_single_lane(pts)
+
+                # DEBUG: Check encoded tokens
+                if step == 0 and img_idx == 0 and lane_idx == 0:
+                    print(f"\nDEBUG: Encoded tokens")
+                    print(f"  x_tokens min/max: {x_np.min()}/{x_np.max()}")
+                    print(f"  y_tokens min/max: {y_np.min()}/{y_np.max()}")
+                    print(f"  x_tokens (first 10): {x_np[:10].tolist()}")
+                    print(f"  y_tokens (first 10): {y_np[:10].tolist()}")
+                    print(f"  Config: nbins_x={tokenizer.cfg.nbins_x}, img_w={tokenizer.cfg.img_w}, x_mode={tokenizer.cfg.x_mode}, max_abs_dx={tokenizer.cfg.max_abs_dx}")
+
+                    # Validate tokens
+                    invalid_mask = x_np >= tokenizer.cfg.nbins_x
+                    if invalid_mask.any():
+                        print(f"  ERROR: {invalid_mask.sum()} tokens >= nbins_x!")
+                        invalid_indices = np.where(invalid_mask)[0]
+                        print(f"  Invalid indices: {invalid_indices.tolist()}")
+                        print(f"  Invalid tokens: {x_np[invalid_indices].tolist()}")
+
+                lane_visual_tokens.append(visual_tokens_imgs[img_idx])
+                lane_x_list.append(torch.from_numpy(x_np).long())
+                lane_y_list.append(torch.from_numpy(y_np).long())
+
+        if not lane_visual_tokens:
+            # No valid lanes in this batch; skip.
+            continue
+
+        # Stack to tensors
+        visual_tokens = torch.stack(lane_visual_tokens).to(device, non_blocking=True)
+        x_tokens = torch.stack(lane_x_list).to(device, non_blocking=True)
+        y_tokens = torch.stack(lane_y_list).to(device, non_blocking=True)
+
+        # Teacher forcing
         x_in = x_tokens.clone()
         y_in = y_tokens.clone()
         x_in[:, 1:] = x_tokens[:, :-1]
-        x_in[:, 0] = pad_token_x
+        # t=0'da BOS yerine GT x0 vererek başlangıcı kolaylaştır
+        x_in[:, 0] = x_tokens[:, 0]
         y_in[:, 1:] = y_tokens[:, :-1]
         y_in[:, 0] = pad_token_y
 
@@ -349,13 +324,14 @@ def train_one_epoch_v2(
             visual_padding_mask=None,
         )
 
-        loss, loss_x, loss_y = lane_lm_loss_v2(
+        loss, loss_x, loss_y = lane_lm_loss_v3(
             logits_x,
             logits_y,
             x_tokens,
             y_tokens,
             pad_token_x=pad_token_x,
             pad_token_y=pad_token_y,
+            y_loss_weight=y_loss_weight,
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -401,7 +377,7 @@ def train_one_epoch_v2(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="LaneLM v2 training on CULane using CLRerNet backbone as visual encoder."
+        description="LaneLM v3 per-lane training on CULane using CLRerNet backbone."
     )
     parser.add_argument(
         "--config",
@@ -425,7 +401,7 @@ def parse_args() -> argparse.Namespace:
         "--train-list",
         type=str,
         default="dataset/list/train_gt.txt",
-        help="CULane train list file relative to repo root.",
+        help="CULane train list file.",
     )
     parser.add_argument(
         "--diff-file",
@@ -443,7 +419,7 @@ def parse_args() -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=4,
-        help="Batch size for training.",
+        help="Batch size (number of images; lanes are flattened inside).",
     )
     parser.add_argument(
         "--num-workers",
@@ -458,6 +434,18 @@ def parse_args() -> argparse.Namespace:
         help="Learning rate for LaneLM head.",
     )
     parser.add_argument(
+        "--no-aug",
+        action="store_true",
+        help="Disable random data augmentations and use validation pipeline "
+        "(Crop+Resize only). Recommended for overfit/debug runs.",
+    )
+    parser.add_argument(
+        "--no-y-loss",
+        action="store_true",
+        help="Train only on X coordinate loss (ignore Y loss). "
+        "Useful for debugging X tokenization issues.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda",
@@ -467,8 +455,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--work-dir",
         type=str,
-        default="work_dirs/lanelm_culane_dla34_v2",
-        help="Directory to save LaneLM checkpoints.",
+        default="work_dirs/lanelm_culane_dla34_v3",
+        help="Directory to save LaneLM v3 checkpoints.",
     )
     return parser.parse_args()
 
@@ -483,8 +471,9 @@ def main() -> None:
 
     hparams = LaneLMHyperParams()
 
-    # DataLoader with GT lanes kept as lists of points
-    dataloader = build_culane_lanelm_dataloader_v2(
+    y_loss_weight = 0.0 if args.no_y_loss else 1.0
+
+    dataloader = build_culane_lanelm_dataloader_v3(
         data_root=args.data_root,
         list_path=args.train_list,
         diff_file=args.diff_file,
@@ -492,46 +481,70 @@ def main() -> None:
         num_workers=args.num_workers,
         img_w=hparams.img_w,
         img_h=hparams.img_h,
+        no_aug=args.no_aug,
     )
 
-    # Frozen CLRerNet feature extractor
     clrernet_model = build_frozen_clrernet_backbone(
         config_path=args.config,
         checkpoint_path=args.checkpoint,
         device=device,
     )
 
-    # Visual feature dimension list from FPN
-    # For CLRerNetFPN, in_channels is [128, 256, 512]; out_channels is 64 for each level
-    # We need the OUTPUT channels, not the input channels
-    visual_in_channels = (64, 64, 64)
-
-    # LaneLM head
-    lanelm_model = build_lanelm_model_v2(
-        hparams=hparams,
-        visual_in_channels=visual_in_channels,
-    ).to(device)
-
-    # Tokenizer consistent with training geometry
+    # Create tokenizer config first to determine vocab size
     tokenizer_cfg = LaneTokenizerConfig(
         img_w=hparams.img_w,
         img_h=hparams.img_h,
         num_steps=hparams.num_points,
         nbins_x=hparams.nbins_x,
+        # Disjoint relative encoding with smaller dx for easier learning
+        x_mode="relative_disjoint",
+        max_abs_dx=32,
     )
     tokenizer = LaneTokenizer(tokenizer_cfg)
+    print(
+        f"Tokenizer config -> x_mode={tokenizer_cfg.x_mode}, "
+        f"max_abs_dx={tokenizer_cfg.max_abs_dx}, nbins_x={tokenizer_cfg.nbins_x}"
+    )
+
+    # Calculate required vocab size
+    vocab_size_x = hparams.nbins_x
+    if tokenizer_cfg.x_mode == "relative_disjoint":
+        # Need: nbins_x (absolute) + 2*max_abs_dx+1 (relative deltas)
+        vocab_size_x = hparams.nbins_x + 2 * tokenizer_cfg.max_abs_dx + 1
+        print(f"Disjoint mode: vocab_size_x = {vocab_size_x}")
+    else:
+        print(f"Overlapping relative mode: vocab_size_x = {vocab_size_x}")
+
+    # Build model with correct vocab size
+    visual_in_channels = (64, 64, 64)
+
+    # Temporarily set nbins_x for model
+    original_nbins_x = hparams.nbins_x
+    hparams.nbins_x = vocab_size_x
+
+    lanelm_model = build_lanelm_model_v3(
+        hparams=hparams,
+        visual_in_channels=visual_in_channels,
+    ).to(device)
+
+    # Restore original
+    hparams.nbins_x = original_nbins_x
 
     optimizer = optim.AdamW(lanelm_model.parameters(), lr=args.lr)
 
+    # Y loss weight: 0.0 if --no-y-loss, else 1.0
+    y_loss_weight = 0.0 if args.no_y_loss else 1.0
+    if args.no_y_loss:
+        print("Training with X-only loss (Y loss disabled)")
+
     os.makedirs(args.work_dir, exist_ok=True)
 
-    # Loss log file for later analysis (tab-separated)
     loss_log_path = os.path.join(args.work_dir, "loss_log.tsv")
     with open(loss_log_path, "w") as f:
         f.write("epoch\tstep\tloss\tloss_x\tloss_y\n")
 
     for epoch in range(1, args.epochs + 1):
-        train_one_epoch_v2(
+        train_one_epoch_v3(
             epoch=epoch,
             clrernet_model=clrernet_model,
             lanelm_model=lanelm_model,
@@ -540,6 +553,7 @@ def main() -> None:
             device=device,
             tokenizer=tokenizer,
             hparams=hparams,
+            y_loss_weight=y_loss_weight,
             loss_log_path=loss_log_path,
         )
 
@@ -547,7 +561,7 @@ def main() -> None:
         if epoch % 50 == 0 or epoch == args.epochs:
             ckpt_path = os.path.join(
                 args.work_dir,
-                f"lanelm_culane_dla34_v2_epoch{epoch}.pth",
+                f"lanelm_culane_dla34_v3_epoch{epoch}.pth",
             )
             torch.save(
                 {
@@ -562,14 +576,22 @@ def main() -> None:
                         "num_heads": hparams.num_heads,
                         "ffn_dim": hparams.ffn_dim,
                         "max_lanes": hparams.max_lanes,
+                        "per_lane": True,
+                        "x_mode": tokenizer_cfg.x_mode,
+                        "max_abs_dx": tokenizer_cfg.max_abs_dx,
                     },
                 },
                 ckpt_path,
             )
-            print(f"Saved LaneLM v2 checkpoint to: {ckpt_path}")
+            print(f"Saved LaneLM v3 checkpoint to: {ckpt_path}")
 
-    print("LaneLM v2 training finished.")
+    print("LaneLM v3 training finished.")
 
 
 if __name__ == "__main__":
     main()
+    parser.add_argument(
+        "--no-y-loss",
+        action="store_true",
+        help="Disable y-token loss (debug only; focus on x modeling).",
+    )

@@ -30,13 +30,16 @@ class KeypointEmbedding(nn.Module):
         self.x_embedding = nn.Embedding(nbins_x, embed_dim)
         self.y_embedding = nn.Embedding(max_y_tokens, embed_dim)
         self.pos_embedding = nn.Embedding(max_len, embed_dim)
+        # Lane ID Embedding (for Multi-Lane One-to-Many handling)
+        self.lane_embedding = nn.Embedding(8, embed_dim) # Support up to 8 lanes
 
-    def forward(self, x_tokens: torch.Tensor, y_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_tokens: torch.Tensor, y_tokens: torch.Tensor, lane_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Embed (x_tokens, y_tokens) into a sequence of vectors.
 
         Args:
             x_tokens: LongTensor of shape (B, T)
             y_tokens: LongTensor of shape (B, T)
+            lane_indices: LongTensor of shape (B,) or (B, T) - Optional lane ID.
 
         Returns:
             Tensor of shape (B, T, D)
@@ -45,10 +48,28 @@ class KeypointEmbedding(nn.Module):
             raise ValueError("x_tokens and y_tokens must have shape (B, T).")
 
         batch_size, seq_len = x_tokens.shape
+
+        # Validate sequence length
         if seq_len > self.max_len:
             raise ValueError(
                 f"Sequence length {seq_len} exceeds max_len={self.max_len}."
             )
+
+        # Validate token ranges to prevent embedding lookup errors
+        if seq_len > 0:
+            x_max = x_tokens.max().item()
+            y_max = y_tokens.max().item()
+
+            if x_max >= self.nbins_x:
+                raise ValueError(
+                    f"x_tokens contain value {x_max} >= nbins_x={self.nbins_x}. "
+                    f"This indicates a configuration mismatch between training and inference."
+                )
+            if y_max >= self.max_y_tokens:
+                raise ValueError(
+                    f"y_tokens contain value {y_max} >= max_y_tokens={self.max_y_tokens}. "
+                    f"y_tokens should be in range [0, {self.max_y_tokens-1}]."
+                )
 
         device = x_tokens.device
         pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
@@ -57,7 +78,18 @@ class KeypointEmbedding(nn.Module):
         y_emb = self.y_embedding(y_tokens)
         pos_emb = self.pos_embedding(pos_ids)
 
-        return x_emb + y_emb + pos_emb
+        out = x_emb + y_emb + pos_emb
+        
+        if lane_indices is not None:
+            # If lane_indices is (B,), expand to (B, T)
+            if lane_indices.dim() == 1:
+                lane_indices = lane_indices.unsqueeze(1).expand(-1, seq_len)
+            
+            lane_emb = self.lane_embedding(lane_indices)
+            # Signal Boosting: Multiply Lane Embedding by 10.0 to force attention
+            out = out + (lane_emb * 10.0)
+
+        return out
 
 
 class VisualTokenEncoder(nn.Module):
@@ -71,18 +103,27 @@ class VisualTokenEncoder(nn.Module):
     In practice we assume Fi are the FPN outputs from CLRerNetFPN:
       Fi: (B, C_i, H_i, W_i)
     and flatten each spatial location as a "patch".
+    
+    Key improvement: Uses 2D sinusoidal positional embeddings to preserve
+    spatial structure, which is critical for lane detection.
     """
 
     def __init__(
         self,
         in_channels: Sequence[int],
         embed_dim: int,
+        use_2d_pe: bool = True,  # NEW: Enable 2D positional embedding
     ) -> None:
         super().__init__()
         self.in_channels = list(in_channels)
         self.embed_dim = embed_dim
+        self.use_2d_pe = use_2d_pe
 
-        # Per-level linear projection to embed_dim
+        # Per-level LayerNorm + linear projection to embed_dim
+        # LayerNorm is critical because CLRerNet FPN outputs have large variance!
+        self.norm_per_level = nn.ModuleList(
+            [nn.LayerNorm(c) for c in self.in_channels]
+        )
         self.proj_per_level = nn.ModuleList(
             [nn.Linear(c, embed_dim) for c in self.in_channels]
         )
@@ -90,14 +131,58 @@ class VisualTokenEncoder(nn.Module):
         # Level embeddings (encode which FPN level a token comes from)
         self.level_embed = nn.Embedding(len(self.in_channels), embed_dim)
 
-        # We use simple learnable 1D positional embedding over the concatenated
-        # sequence length (N_total). This is a pragmatic approximation of
-        # PE_vision(H_i, W_i) in the paper.
-        # For CLRerNet FPN on 800x320 inputs, the three feature levels are
-        # typically 40x100, 20x50 and 10x25, i.e. 4000 + 1000 + 250 = 5250
-        # tokens. We set a safe upper bound here.
-        self.max_tokens = 8192
-        self.pos_embedding = nn.Embedding(self.max_tokens, embed_dim)
+        # Positional embedding options
+        if use_2d_pe:
+            # 2D sinusoidal PE will be computed on-the-fly based on H, W
+            # No learnable parameters needed for sinusoidal
+            pass
+        else:
+            # Fallback: 1D learnable positional embedding (legacy)
+            self.max_tokens = 8192
+            self.pos_embedding = nn.Embedding(self.max_tokens, embed_dim)
+
+    def _get_2d_sincos_pos_embed(self, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Generate 2D sinusoidal positional embeddings.
+        
+        This preserves spatial structure by encoding (x, y) positions separately
+        and concatenating them, similar to ViT and DETR.
+        
+        Returns: (H*W, embed_dim) tensor
+        """
+        embed_dim = self.embed_dim
+        assert embed_dim % 2 == 0, "embed_dim must be divisible by 2 for 2D PE"
+        
+        half_dim = embed_dim // 2
+        
+        # Create position grids
+        y_pos = torch.arange(H, device=device, dtype=torch.float32)
+        x_pos = torch.arange(W, device=device, dtype=torch.float32)
+        
+        # Normalize to [0, 1]
+        y_pos = y_pos / max(H - 1, 1)
+        x_pos = x_pos / max(W - 1, 1)
+        
+        # Create meshgrid
+        y_grid, x_grid = torch.meshgrid(y_pos, x_pos, indexing='ij')
+        y_grid = y_grid.reshape(-1)  # (H*W,)
+        x_grid = x_grid.reshape(-1)  # (H*W,)
+        
+        # Frequency bands (similar to Transformer positional encoding)
+        freq_bands = torch.arange(half_dim // 2, device=device, dtype=torch.float32)
+        freq_bands = 1.0 / (10000 ** (2 * freq_bands / half_dim))
+        
+        # Compute sin/cos embeddings for x and y
+        x_embed = x_grid.unsqueeze(-1) * freq_bands.unsqueeze(0) * 3.14159  # (H*W, half_dim//2)
+        y_embed = y_grid.unsqueeze(-1) * freq_bands.unsqueeze(0) * 3.14159  # (H*W, half_dim//2)
+        
+        # Interleave sin and cos
+        x_pe = torch.stack([x_embed.sin(), x_embed.cos()], dim=-1).reshape(-1, half_dim)  # (H*W, half_dim)
+        y_pe = torch.stack([y_embed.sin(), y_embed.cos()], dim=-1).reshape(-1, half_dim)  # (H*W, half_dim)
+        
+        # Concatenate x and y embeddings
+        pos_embed = torch.cat([x_pe, y_pe], dim=-1)  # (H*W, embed_dim)
+        
+        return pos_embed
 
     def forward(self, feats: Sequence[torch.Tensor]) -> torch.Tensor:
         """Encode FPN feature maps into a single token sequence.
@@ -118,7 +203,7 @@ class VisualTokenEncoder(nn.Module):
         device = feats[0].device
 
         level_tokens: List[torch.Tensor] = []
-        for lvl, (feat, proj) in enumerate(zip(feats, self.proj_per_level)):
+        for lvl, (feat, norm, proj) in enumerate(zip(feats, self.norm_per_level, self.proj_per_level)):
             B, C, H, W = feat.shape
             if C != self.in_channels[lvl]:
                 raise ValueError(
@@ -128,8 +213,15 @@ class VisualTokenEncoder(nn.Module):
 
             # (B, C, H, W) -> (B, H*W, C)
             x = feat.view(B, C, H * W).permute(0, 2, 1).contiguous()
+            # LayerNorm to stabilize the large-variance FPN outputs
+            x = norm(x)  # (B, H*W, C) normalized
             # Linear projection to embed_dim
             x = proj(x)  # (B, H*W, D)
+
+            # Add 2D positional embedding for THIS level
+            if self.use_2d_pe:
+                pos_emb = self._get_2d_sincos_pos_embed(H, W, device)  # (H*W, D)
+                x = x + pos_emb.unsqueeze(0)  # Broadcast over batch
 
             # Add level embedding
             lvl_emb = self.level_embed.weight[lvl].view(1, 1, -1)  # (1,1,D)
@@ -138,19 +230,20 @@ class VisualTokenEncoder(nn.Module):
 
         # Concatenate levels along token dimension
         visual_tokens = torch.cat(level_tokens, dim=1)  # (B, N_total, D)
-        _, n_tokens, _ = visual_tokens.shape
-        if n_tokens > self.max_tokens:
-            raise ValueError(
-                f"Number of visual tokens {n_tokens} exceeds "
-                f"max_tokens={self.max_tokens}."
+        
+        # If using legacy 1D PE (not recommended), apply it here
+        if not self.use_2d_pe:
+            _, n_tokens, _ = visual_tokens.shape
+            if n_tokens > self.max_tokens:
+                raise ValueError(
+                    f"Number of visual tokens {n_tokens} exceeds "
+                    f"max_tokens={self.max_tokens}."
+                )
+            pos_ids = torch.arange(n_tokens, device=device).unsqueeze(0).expand(
+                batch_size, -1
             )
-
-        # Positional embedding over the concatenated sequence
-        pos_ids = torch.arange(n_tokens, device=device).unsqueeze(0).expand(
-            batch_size, -1
-        )
-        pos_emb = self.pos_embedding(pos_ids)
-        visual_tokens = visual_tokens + pos_emb
+            pos_emb = self.pos_embedding(pos_ids)
+            visual_tokens = visual_tokens + pos_emb
 
         return visual_tokens
 
@@ -259,6 +352,12 @@ class LaneLMDecoder(nn.Module):
 
     @staticmethod
     def _generate_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+        # Input validation to prevent CUDA device-side assert
+        if not isinstance(seq_len, int) or seq_len <= 0:
+            raise ValueError(f"Invalid seq_len: {seq_len}. Must be a positive integer.")
+        if seq_len > 1024:  # Reasonable upper limit to prevent memory issues
+            raise ValueError(f"seq_len too large: {seq_len}. Maximum allowed is 1024.")
+
         # True values in the upper triangle (future positions) will be masked
         mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=1)
         return mask
@@ -274,7 +373,18 @@ class LaneLMDecoder(nn.Module):
         - memory: (B, N, D)
         - memory_key_padding_mask: (B, N) or None
         """
-        batch_size, seq_len, _ = tgt.shape
+        # Validate input tensor shapes
+        if tgt.dim() != 3:
+            raise ValueError(f"tgt must be 3D tensor (B, T, D), got shape {tgt.shape}")
+
+        batch_size, seq_len, embed_dim = tgt.shape
+
+        # Early validation to prevent CUDA device-side assert
+        if seq_len <= 0:
+            raise ValueError(f"Invalid sequence length: {seq_len}. tgt.shape: {tgt.shape}")
+        if seq_len > 1024:  # Reasonable upper limit
+            raise ValueError(f"Sequence length too large: {seq_len}. Maximum allowed is 1024.")
+
         device = tgt.device
         tgt_mask = self._generate_causal_mask(seq_len, device)
 
@@ -338,6 +448,16 @@ class LaneLMModel(nn.Module):
         visual_in_channels: Optional[Sequence[int]] = None,
     ) -> None:
         super().__init__()
+
+        # Validation to prevent configuration mismatches
+        if nbins_x <= 0:
+            raise ValueError(f"nbins_x must be positive, got {nbins_x}")
+        if nbins_x < 300:
+            print(f"WARNING: nbins_x={nbins_x} < 300. If using BOS tokens [296,297,298,299], this may cause index out of bounds errors.")
+            print("Consider setting nbins_x=300 to include BOS tokens and relative token space.")
+        if max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+
         self.nbins_x = nbins_x
         self.max_y_tokens = max_y_tokens
         self.embed_dim = embed_dim
@@ -389,6 +509,7 @@ class LaneLMModel(nn.Module):
         x_tokens: torch.Tensor,
         y_tokens: torch.Tensor,
         visual_padding_mask: Optional[torch.Tensor] = None,
+        lane_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
@@ -404,6 +525,7 @@ class LaneLMModel(nn.Module):
             x_tokens: (B, T) discrete x tokens.
             y_tokens: (B, T) discrete y / step tokens.
             visual_padding_mask: optional (B, N) mask for visual tokens.
+            lane_indices: optional (B,) lane IDs for multi-lane prediction.
 
         Returns:
             logits_x: (B, T, nbins_x)
@@ -416,6 +538,27 @@ class LaneLMModel(nn.Module):
             - If only ``visual_in_dim`` was provided, ``visual_tokens`` is
               projected to ``embed_dim`` when necessary.
         """
+        # Early validation to catch BOS token vocabulary mismatches
+        if x_tokens.dim() != 2 or y_tokens.dim() != 2:
+            raise ValueError(f"x_tokens and y_tokens must be 2D tensors, got shapes {x_tokens.shape}, {y_tokens.shape}")
+
+        # Validate token ranges before embedding to prevent index out of bounds
+        x_max = x_tokens.max().item()
+        y_max = y_tokens.max().item()
+
+        if x_max >= self.nbins_x:
+            raise ValueError(
+                f"x_tokens contain value {x_max} >= nbins_x={self.nbins_x}. "
+                f"This usually happens when:\n"
+                f"  1. Training used nbins_x=300 with BOS tokens [296,297,298,299]\n"
+                f"  2. Inference uses nbins_x={self.nbins_x}\n"
+                f"  3. Solution: Set nbins_x=300 in test config"
+            )
+        if y_max >= self.max_y_tokens:
+            raise ValueError(
+                f"y_tokens contain value {y_max} >= max_y_tokens={self.max_y_tokens}"
+            )
+
         # Encode / project visual tokens to the model's embedding dimension.
         if self.visual_encoder is not None:
             # visual_tokens are assumed to be already encoded to (B, N, D).
@@ -423,7 +566,7 @@ class LaneLMModel(nn.Module):
         elif self.visual_proj is not None:
             visual_tokens = self.visual_proj(visual_tokens)
 
-        keypoint_emb = self.keypoint_embed(x_tokens, y_tokens)
+        keypoint_emb = self.keypoint_embed(x_tokens, y_tokens, lane_indices)
         hidden = self.decoder(
             tgt=keypoint_emb,
             memory=visual_tokens,
