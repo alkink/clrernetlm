@@ -47,54 +47,6 @@ def extract_p5_feat(model, imgs: torch.Tensor):
     return [p5]
 
 
-def autoregressive_decode(
-    lanelm_model, visual_tokens, num_points, nbins_x, max_lanes, bos_token_ids
-):
-    device = visual_tokens.device
-    B = visual_tokens.shape[0]
-    T = num_points
-    pad_token_x = 0
-    
-    all_x = []
-    all_y = []
-
-    for lane_idx in range(max_lanes):
-        lane_id_tensor = torch.full((B,), lane_idx, dtype=torch.long, device=device)
-        current_bos = bos_token_ids[lane_idx]
-        
-        x_out = torch.full((B, T), pad_token_x, dtype=torch.long, device=device)
-        y_out = torch.full((B, T), 0, dtype=torch.long, device=device)
-        
-        x_in = torch.full((B, T), pad_token_x, dtype=torch.long, device=device)
-        x_in[:, 0] = current_bos
-        y_in = torch.full((B, T), 0, dtype=torch.long, device=device)
-        
-        for t in range(T):
-            logits_x, logits_y = lanelm_model(
-                visual_tokens, x_tokens=x_in, y_tokens=y_in, lane_indices=lane_id_tensor
-            )
-            
-            step_logits_x = logits_x[:, t, :]
-            for bid in bos_token_ids:
-                step_logits_x[:, bid] = -float('inf')
-            pred_x = torch.argmax(step_logits_x, dim=-1)
-            
-            step_logits_y = logits_y[:, t, :]
-            pred_y = torch.argmax(step_logits_y, dim=-1)
-            
-            x_out[:, t] = pred_x
-            y_out[:, t] = pred_y
-            
-            if t + 1 < T:
-                x_in[:, t+1] = pred_x
-                y_in[:, t+1] = pred_y
-        
-        all_x.append(x_out.cpu())
-        all_y.append(y_out.cpu())
-
-    return torch.stack(all_x, dim=1), torch.stack(all_y, dim=1)
-
-
 def load_gt_lanes(gt_path):
     """Load ground truth lanes from .lines.txt file."""
     lanes = []
@@ -134,13 +86,10 @@ def main():
     
     # Model config
     nbins_x = 200
-    max_abs_dx = 32
-    total_vocab_size = 300
-    bos_token_ids = [296, 297, 298, 299]
     max_lanes = 4
 
     hparams = LaneLMHyperParams(
-        nbins_x=total_vocab_size,
+        nbins_x=nbins_x,
         num_points=40,
         embed_dim=256,
         num_layers=4,
@@ -153,8 +102,7 @@ def main():
         img_h=hparams.img_h,
         num_steps=hparams.num_points,
         nbins_x=nbins_x,
-        x_mode="relative_disjoint",
-        max_abs_dx=max_abs_dx
+        x_mode="absolute",
     )
     tokenizer = LaneTokenizer(tokenizer_cfg)
     
@@ -211,9 +159,8 @@ def main():
             feats = extract_p5_feat(clrernet, img_tensor)
             visual_tokens = lanelm.encode_visual_tokens(feats)
             
-            x_tokens_all, y_tokens_all = autoregressive_decode(
-                lanelm, visual_tokens, tokenizer.cfg.num_steps,
-                lanelm.nbins_x, max_lanes, bos_token_ids
+            x_tokens_all, y_tokens_all = visual_first_decode(
+                lanelm, visual_tokens, tokenizer_cfg, max_lanes
             )
         
         x_tokens_np = x_tokens_all[0].numpy()  # (max_lanes, T)

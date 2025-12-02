@@ -113,9 +113,29 @@ class LaneTokenizer:
         # Evaluate spline at all sample_ys
         xs = spline(sample_ys)
 
-        # Absolute x mode: identical to original behavior
+        # Absolute x mode: identical to original behavior BUT with a critical fix:
+        # we only trust the spline within the vertical support of the original GT points.
+        # Outside [y_min, y_max] we KEEP padding so the model is NOT forced to
+        # hallucinate lanes where there is no annotation (e.g. near the car hood).
         if self.cfg.x_mode == "absolute":
+            # Compute valid vertical range from raw GT points (in pixel space)
+            # points[:, 1] is y in pixels.
+            if points.shape[0] > 0:
+                y_min = float(points[:, 1].min())
+                y_max = float(points[:, 1].max())
+            else:
+                y_min, y_max = 0.0, float(self.cfg.img_h)
+
             for t in range(self.T):
+                y_sample = float(sample_ys[t])
+
+                # NEW: Skip samples outside the annotated vertical support.
+                # This prevents extrapolation-induced zigzag in regions where
+                # the GT does not actually define a lane (e.g. near the bumper).
+                if y_sample < y_min or y_sample > y_max:
+                    # Leave padding tokens as-is.
+                    continue
+
                 x = float(xs[t])
                 # Check if the point lies inside the image horizontally
                 if x < 0.0 or x >= float(self.cfg.img_w):
@@ -295,8 +315,8 @@ class LaneTokenizer:
                 
                 x_eval = coords[:, 0]
                 
-                # Stronger smoothing: window_length=11 for better zigzag removal
-                window_length = min(11, len(x_eval))
+                # FIX 8: Daha güçlü smoothing: window_length=15 for better zigzag removal
+                window_length = min(15, len(x_eval))
                 if window_length % 2 == 0:
                     window_length -= 1
                 

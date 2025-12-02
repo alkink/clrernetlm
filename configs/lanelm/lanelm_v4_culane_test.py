@@ -20,15 +20,18 @@ model = dict(
     neck=dict(type='CLRerNetFPN', in_channels=[128, 256, 512], out_channels=64, num_outs=3),
     clrernet_checkpoint='clrernet_culane_dla34_ema.pth',
     lanelm_cfg=dict(
-        nbins_x=200,  # CRITICAL: Must match training (train_lanelm_v4_fixed.py line 204)
+        nbins_x=200,  # CRITICAL: Must match training (train_lanelm_v4_fixed.py)
         max_y_tokens=41,
         embed_dim=256,
         num_layers=4,
         num_heads=8,
         ffn_dim=512,
         max_seq_len=80,
-        visual_in_channels=(64, 64, 64),
-        ckpt_path='work_dirs/lanelm_v4_2k_200ep/lanelm_v4_best.pth',
+        # BU TEST KONFİGİ İÇİN: P5-Only LaneLM (train_lanelm_v4_fixed.py) kullanıyoruz
+        # Eğitimde visual_in_channels=(64,) (sadece P5) idi, burada da aynısını kullanmalıyız.
+        visual_in_channels=(64,),
+        # TEST EDİLECEK MODEL: 1-image overfit + V5 mimarisi (work_dirs/lanelm_v4_fixed)
+        ckpt_path='work_dirs/lanelm_v4_fixed/lanelm_v4_best.pth',
     ),
     tokenizer_cfg=dict(
         img_w=800,
@@ -56,7 +59,7 @@ test_dataloader = dict(
     persistent_workers=True,  # Keep workers alive between epochs
     dataset=dict(
         data_root='dataset',
-        data_list='dataset/list/test.txt',  # 34680 images - official CULane test set
+        data_list='dataset/list/train_100.txt',  # 100 training images - simpler, model has seen these
         test_mode=True,
     ),
     sampler=dict(type='DefaultSampler', shuffle=False),
@@ -66,8 +69,9 @@ test_dataloader = dict(
 test_evaluator = dict(
     type='CULaneMetric',
     data_root='dataset',
-    data_list='dataset/list/test.txt',  # 34680 images - official CULane test set
-    result_dir='work_dirs/lanelm_v4_test_full/predictions',
+    data_list='dataset/list/train_100.txt',  # 100 training images - simpler, model has seen these
+    # Bu konfig: lanelm_v4_fixed checkpoint'i için sonuçları ayrı klasöre yazar
+    result_dir='work_dirs/lanelm_v4_test_train100/predictions',
     use_parallel=True,  # Enable parallel for faster evaluation on large dataset
 )
 

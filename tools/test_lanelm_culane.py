@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from libs.datasets import CulaneDataset
 from libs.datasets.metrics.culane_metric import eval_predictions
 from libs.models.lanelm import LaneLMModel, LaneTokenizer, LaneTokenizerConfig
+from libs.models.detectors.lanelm_detector import autoregressive_decode as visual_first_decode
 
 from tools.train_lanelm_culane_v3 import (
     LaneLMHyperParams,
@@ -63,70 +64,6 @@ def collate_test_batch(batch):
     imgs = torch.stack([torch.from_numpy(item["img"]).permute(2, 0, 1).float() / 255.0 for item in batch])
     sub_img_names = [item.get("sub_img_name", item.get("filename", "unknown")) for item in batch]
     return {"inputs": imgs, "sub_img_names": sub_img_names}
-
-
-def autoregressive_decode(
-    lanelm_model,
-    visual_tokens,
-    num_points,
-    nbins_x,
-    max_lanes,
-    bos_token_ids,
-):
-    """Autoregressive decoding for LaneLM inference."""
-    device = visual_tokens.device
-    B = visual_tokens.shape[0]
-    T = num_points
-    pad_token_x = 0
-
-    all_x = []
-    all_y = []
-
-    for lane_idx in range(max_lanes):
-        lane_id_tensor = torch.full((B,), lane_idx, dtype=torch.long, device=device)
-        current_bos = bos_token_ids[lane_idx]
-        
-        x_out = torch.full((B, T), pad_token_x, dtype=torch.long, device=device)
-        y_out = torch.full((B, T), 0, dtype=torch.long, device=device)
-        
-        x_in = torch.full((B, T), pad_token_x, dtype=torch.long, device=device)
-        x_in[:, 0] = current_bos
-        y_in = torch.full((B, T), 0, dtype=torch.long, device=device)
-
-        for t in range(T):
-            logits_x, logits_y = lanelm_model(
-                visual_tokens, 
-                x_in, 
-                y_in, 
-                None,  # visual_padding_mask
-                lane_id_tensor  # lane_indices
-            )
-            
-            # Greedy X (mask BOS tokens)
-            step_logits_x = logits_x[:, t, :]
-            for bid in bos_token_ids:
-                step_logits_x[:, bid] = -float('inf')
-            pred_x = torch.argmax(step_logits_x, dim=-1)
-            
-            # Greedy Y
-            step_logits_y = logits_y[:, t, :]
-            pred_y = torch.argmax(step_logits_y, dim=-1)
-            
-            # Clamp to valid ranges
-            pred_x = pred_x.clamp(0, nbins_x - 1)
-            pred_y = pred_y.clamp(0, T)  # max_y_tokens = T + 1
-            
-            x_out[:, t] = pred_x
-            y_out[:, t] = pred_y
-            
-            if t + 1 < T:
-                x_in[:, t+1] = pred_x
-                y_in[:, t+1] = pred_y
-        
-        all_x.append(x_out.cpu())
-        all_y.append(y_out.cpu())
-
-    return torch.stack(all_x, dim=1), torch.stack(all_y, dim=1)
 
 
 def hallucination_removal(lane_points, width=800):
@@ -233,38 +170,23 @@ def main():
 
     # Model hyperparameters (must match training)
     nbins_x = 200 
-    max_abs_dx = 32 
-    total_vocab_size = 300
-    # V4 uses lane_indices instead of BOS tokens, so use 0 (padding) as start
-    bos_token_ids = [0, 0, 0, 0]  # No explicit BOS for absolute tokenization
     max_lanes = 4
 
     hparams = LaneLMHyperParams(
-        nbins_x=total_vocab_size, 
+        nbins_x=nbins_x, 
         num_points=40,
         embed_dim=256,
         num_layers=4,
         max_lanes=max_lanes, 
     )
 
-    # Build tokenizer
-    tokenizer_cfg = LaneTokenizerConfig(
-        img_w=hparams.img_w, 
-        img_h=hparams.img_h,
-        num_steps=hparams.num_points, 
-        nbins_x=nbins_x,
-        x_mode="relative_disjoint", 
-        max_abs_dx=max_abs_dx
-    )
-    tokenizer = LaneTokenizer(tokenizer_cfg)
-    
     # Build models
     print("Loading CLRerNet backbone...")
     clrernet = build_frozen_clrernet_backbone(args.config, args.backbone_checkpoint, device)
     
     print("Loading LaneLM model...")
     lanelm = build_lanelm_model_v3(hparams, visual_in_channels=(64,)).to(device)
-    
+
     # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location=device)
     
@@ -294,13 +216,10 @@ def main():
         img_h=hparams.img_h,
         num_steps=hparams.num_points, 
         nbins_x=nbins_x,
-        x_mode="relative_disjoint" if nbins_x < 300 else "absolute", # Heuristic: small nbins usually means relative
-        max_abs_dx=max_abs_dx
+        x_mode="absolute",
     )
-    # Override x_mode if it was absolute in training (usually nbins_x=800 is absolute)
-    if nbins_x == 800:
-        tokenizer_cfg.x_mode = "absolute"
-        
+    if "config" in ckpt and "x_mode" in ckpt["config"]:
+        tokenizer_cfg.x_mode = ckpt["config"]["x_mode"]
     tokenizer = LaneTokenizer(tokenizer_cfg)
 
     # Re-build model with updated hparams
@@ -376,14 +295,12 @@ def main():
                 feats = extract_p5_feat(clrernet, imgs)
             visual_tokens = lanelm.encode_visual_tokens(feats)
 
-            # Decode lanes
-            x_tokens_all, y_tokens_all = autoregressive_decode(
+            # Decode lanes (visual-first AR decode, matches training visualize)
+            x_tokens_all, y_tokens_all = visual_first_decode(
                 lanelm_model=lanelm,
                 visual_tokens=visual_tokens,
-                num_points=tokenizer.cfg.num_steps,
-                nbins_x=lanelm.nbins_x,
+                tokenizer_cfg=tokenizer_cfg,
                 max_lanes=max_lanes,
-                bos_token_ids=bos_token_ids,
             )
 
             x_tokens_np = x_tokens_all.numpy()

@@ -1,14 +1,13 @@
 """
-LaneLM v4 Training Script - FIXED VERSION
+LaneLM v4 Full Dataset Training Script - RTX 3090 Optimized
 
-Key Fixes from Debug Analysis:
-1. Full FPN (P3+P4+P5) instead of P5-only → More visual tokens with spatial detail
-2. 2D Positional Embedding → Preserve spatial structure
-3. Absolute Tokenization → Simpler, easier to learn (no relative delta confusion)
-4. Single image overfit first → Verify model can learn before scaling
-
-This script addresses the POSTERIOR COLLAPSE issue where cross-attention
-was uniform (0.998 uniformity score) and model ignored visual information.
+Full CULane training set için optimize edilmiş versiyon:
+- Batch size: 12 (RTX 3090 24GB VRAM için)
+- Full dataset: dataset/list/train.txt (~88k images)
+- Epochs: 50-100 (full dataset için yeterli)
+- Learning rate: 3e-4 with cosine annealing
+- Data augmentation: Clean pipeline (no augmentation)
+- V5 Architecture: P5 Only + 2D PE + Absolute Tokenization
 """
 
 import argparse
@@ -17,7 +16,7 @@ import cv2
 import numpy as np
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 from libs.datasets import CulaneDataset
 from libs.models.lanelm import LaneLMModel, LaneTokenizer, LaneTokenizerConfig
@@ -34,7 +33,7 @@ from configs.clrernet.culane.dataset_culane_clrernet import (
 )
 
 
-# Clean pipeline (no augmentation for overfit test)
+# Clean pipeline (no augmentation for full training)
 clean_pipeline = [
     dict(type="Compose", params=compose_cfg),
     dict(
@@ -49,18 +48,13 @@ clean_pipeline = [
 ]
 
 
-def extract_full_fpn_feats(model, imgs: torch.Tensor):
-    """Extract ALL FPN levels (P3, P4, P5) for richer visual information."""
-    with torch.no_grad():
-        feats = model.extract_feat(imgs)  # Returns [P3, P4, P5]
-    return feats  # All 3 levels
-
 def extract_p5_feat(model, imgs: torch.Tensor):
     """Extract P5 Only (highest level, lowest resolution) for reduced noise."""
     with torch.no_grad():
         feats = model.extract_feat(imgs)  # Returns [P3, P4, P5]
-        p5 = feats[-1]  # P5 is the last level
-    return [p5]  # Return as list for compatibility
+        if isinstance(feats, (tuple, list)):
+            feats = (feats[-1],)  # P5 only
+    return feats
 
 
 def build_lanelm_model_v4(hparams, visual_in_channels):
@@ -76,14 +70,14 @@ def build_lanelm_model_v4(hparams, visual_in_channels):
         num_heads=8,
         ffn_dim=512,
         max_seq_len=max_seq_len,
-        dropout=0.0,  # No dropout for overfit test
-        visual_in_channels=visual_in_channels,  # Full FPN channels
+        dropout=0.0,  # No dropout for full training
+        visual_in_channels=visual_in_channels,  # P5 Only: (64,)
     )
     return model
 
 
-def build_clean_dataloader(data_root, list_path, batch_size, overfit_size=1):
-    """Build dataloader with optional subset for overfit testing."""
+def build_full_dataloader(data_root, list_path, batch_size, num_workers=4):
+    """Build dataloader for full dataset training."""
     pipeline = [dict(type="albumentation", pipelines=clean_pipeline)]
     dataset = CulaneDataset(
         data_root=data_root,
@@ -93,22 +87,20 @@ def build_clean_dataloader(data_root, list_path, batch_size, overfit_size=1):
         test_mode=False,
     )
     
-    # Take only first N images for overfit test
-    if overfit_size > 0 and overfit_size < len(dataset):
-        dataset = Subset(dataset, list(range(overfit_size)))
-    
     print(f"Dataset size: {len(dataset)}")
     
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=False,  # No shuffle for overfit
-        num_workers=0,  # Single worker for reproducibility
+        shuffle=True,  # Shuffle for full dataset
+        num_workers=num_workers,  # Multiple workers for faster loading
         pin_memory=True,
-        drop_last=False,
+        drop_last=True,  # Drop last incomplete batch for consistent batch size
         collate_fn=collate_lanelm_batch_v3,
+        persistent_workers=True if num_workers > 0 else False,
     )
     return dataloader, dataset
+
 
 def visual_first_decode(model, visual_tokens, tokenizer, device, max_lanes):
     """V5 inference path: visual-first autoregressive decode (same as test)."""
@@ -150,7 +142,7 @@ def visualize(model, clrernet_model, batch, tokenizer, device, epoch, save_dir, 
         if use_p5_only:
             feats = extract_p5_feat(clrernet_model, imgs)
         else:
-            feats = extract_full_fpn_feats(clrernet_model, imgs)
+            raise NotImplementedError("Full FPN not supported in full training")
         visual_tokens = model.encode_visual_tokens(feats)
         
         all_preds = visual_first_decode(model, visual_tokens[:1], tokenizer, device, max_lanes)
@@ -160,7 +152,6 @@ def visualize(model, clrernet_model, batch, tokenizer, device, epoch, save_dir, 
         img_vis = cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR)
         
         # Draw predictions (colored) with smoothing
-        # Filter out padding tokens (0) before decoding
         colors = [(0, 0, 255), (255, 0, 0), (255, 0, 255), (0, 255, 255)]
         for l_idx, (x_tokens, y_tokens) in enumerate(all_preds):
             coords = tokenizer.decode_single_lane(x_tokens, y_tokens, smooth=True)
@@ -190,15 +181,16 @@ def visualize(model, clrernet_model, batch, tokenizer, device, epoch, save_dir, 
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="LaneLM v4 Full Dataset Training")
     parser.add_argument("--config", default="configs/clrernet/culane/clrernet_culane_dla34_ema.py")
     parser.add_argument("--checkpoint", default="clrernet_culane_dla34_ema.pth")
     parser.add_argument("--data-root", default="dataset")
-    parser.add_argument("--list-path", default="dataset/list/train_100.txt", help="Dataset list file (default: train_100.txt for 100-image test)")
-    parser.add_argument("--work-dir", default="work_dirs/lanelm_v4_fixed")
-    parser.add_argument("--overfit-size", type=int, default=1, help="Number of images for overfit test (0=all)")
-    parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate (default: 3e-4, was 1e-3 but too high for 100 images)")
+    parser.add_argument("--list-path", default="dataset/list/train.txt", help="Full training dataset list")
+    parser.add_argument("--work-dir", default="work_dirs/lanelm_v4_full")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs (default: 50 for full dataset)")
+    parser.add_argument("--batch-size", type=int, default=12, help="Batch size (default: 12 for RTX 3090 24GB)")
+    parser.add_argument("--num-workers", type=int, default=4, help="Number of data loading workers (default: 4)")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate (default: 3e-4)")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     
@@ -206,17 +198,13 @@ def main():
     print(f"Using device: {device}")
     os.makedirs(args.work_dir, exist_ok=True)
     
-    # ========== KEY CONFIG CHANGES ==========
+    # ========== KEY CONFIG ==========
     # 1. ABSOLUTE tokenization (simpler, no delta confusion)
     nbins_x = 200  # Quantize X to 200 bins
     
-    # 2. P5 ONLY (reduced noise, ~250 tokens instead of ~6,500)
-    # Full FPN: (64, 64, 64) → P5 Only: (64,)
-    use_p5_only = True  # FIX 1: Reduce visual token noise
-    if use_p5_only:
-        visual_in_channels = (64,)  # P5 Only
-    else:
-        visual_in_channels = (64, 64, 64)  # Full FPN
+    # 2. P5 ONLY (reduced noise, ~65 tokens with adaptive pooling)
+    use_p5_only = True
+    visual_in_channels = (64,)  # P5 Only
     
     # 3. Model hyperparams
     hparams = LaneLMHyperParams(
@@ -227,19 +215,19 @@ def main():
         max_lanes=4,
     )
     
-    # Tokenizer with ABSOLUTE mode (key fix!)
+    # Tokenizer with ABSOLUTE mode
     tokenizer_cfg = LaneTokenizerConfig(
         img_w=hparams.img_w,
         img_h=hparams.img_h,
         num_steps=hparams.num_points,
         nbins_x=nbins_x,
-        x_mode="absolute",  # NOT relative_disjoint!
+        x_mode="absolute",
     )
     tokenizer = LaneTokenizer(tokenizer_cfg)
     
     # Build dataloader
-    dataloader, dataset = build_clean_dataloader(
-        args.data_root, args.list_path, batch_size=1, overfit_size=args.overfit_size
+    dataloader, dataset = build_full_dataloader(
+        args.data_root, args.list_path, batch_size=args.batch_size, num_workers=args.num_workers
     )
     
     # Store first batch for visualization
@@ -249,10 +237,7 @@ def main():
     print("Loading CLRerNet backbone (frozen)...")
     clrernet = build_frozen_clrernet_backbone(args.config, args.checkpoint, device)
     
-    if use_p5_only:
-        print("Building LaneLM v4 (P5 Only + 2D PE + Absolute Tokens + X-Loss Only)...")
-    else:
-        print("Building LaneLM v4 (Full FPN + 2D PE + Absolute Tokens)...")
+    print("Building LaneLM v4 (P5 Only + 2D PE + Absolute Tokens + X-Loss Only)...")
     lanelm = build_lanelm_model_v4(hparams, visual_in_channels).to(device)
     
     # Print model info
@@ -262,64 +247,50 @@ def main():
     # Check visual token count with first batch
     with torch.no_grad():
         test_imgs = fixed_batch["inputs"].to(device)
-        if use_p5_only:
-            test_feats = extract_p5_feat(clrernet, test_imgs)
-        else:
-            test_feats = extract_full_fpn_feats(clrernet, test_imgs)
+        test_feats = extract_p5_feat(clrernet, test_imgs)
         test_vis_tokens = lanelm.encode_visual_tokens(test_feats)
         print(f"Visual tokens shape: {test_vis_tokens.shape}")
-        if use_p5_only:
-            # V5: With adaptive pooling, P5 (10,25) -> (5,13) = 65 tokens
-            original_tokens = test_feats[0].shape[2] * test_feats[0].shape[3]
-            actual_tokens = test_vis_tokens.shape[1]
-            print(f"  P5 Only: {test_feats[0].shape} -> {original_tokens} tokens (original) -> {actual_tokens} tokens (V5 adaptive pooling)")
-        else:
-            print(f"  P3: {test_feats[0].shape} -> {test_feats[0].shape[2]*test_feats[0].shape[3]} tokens")
-            print(f"  P4: {test_feats[1].shape} -> {test_feats[1].shape[2]*test_feats[1].shape[3]} tokens")
-            print(f"  P5: {test_feats[2].shape} -> {test_feats[2].shape[2]*test_feats[2].shape[3]} tokens")
+        original_tokens = test_feats[0].shape[2] * test_feats[0].shape[3]
+        actual_tokens = test_vis_tokens.shape[1]
+        print(f"  P5 Only: {test_feats[0].shape} -> {original_tokens} tokens (original) -> {actual_tokens} tokens (V5 adaptive pooling)")
     
     # Optimizer
     optimizer = optim.Adam(lanelm.parameters(), lr=args.lr, weight_decay=0.0)
     
-    # FIX 2: LR Scheduler (Cosine Annealing)
+    # LR Scheduler (Cosine Annealing)
     from torch.optim.lr_scheduler import CosineAnnealingLR
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     
     # Loss functions
-    # X Loss: Ignore padding token (iç bölge için)
     loss_x_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer_cfg.pad_token_x, reduction='mean')
-    # V5: Padding bölgesi için ayrı loss (X=0 öğrenilsin diye, ignore yok)
     loss_x_pad_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-    # Y Loss: Ignore padding token (T=40 is used as pad for Y in tokenizer)
-    pad_y = tokenizer.T  # T is used as padding/EOS for Y
+    pad_y = tokenizer.T
     loss_y_fn = torch.nn.CrossEntropyLoss(ignore_index=pad_y, reduction='mean')
     
-    # FIX 1: Y-Loss disabled initially (only X-loss)
-    # FIX 5: Aşamalı Y-loss ekleme (epoch bazlı)
-    # FIX 7: Y-loss weight çok düşük (0.05) çünkü Y token'ları zaten sıralı
-    # FIX 8: Y-loss'u tamamen kaldır (test için) - Y token'ları zaten sıralı, gereksiz
-    use_y_loss = False  # FIX 8: Y-loss tamamen kapalı (test için)
-    y_loss_start_epoch = 999999  # Y-loss'u hiç ekleme (test için)
-    y_loss_warmup_epochs = 50  # Y-loss weight'i yavaşça artır
-    y_loss_final_weight = 0.05  # FIX 7: Çok düşük weight (0.3 yerine 0.05)
+    # Y-Loss disabled (X-loss only)
+    use_y_loss = False
+    y_loss_start_epoch = 999999
+    y_loss_warmup_epochs = 50
+    y_loss_final_weight = 0.05
     
-    print(f"\nStarting V4 OVERFIT Test ({args.overfit_size} images)...")
-    if use_p5_only:
-        print(f"Config: P5 Only + 2D PE + Absolute Tokenization + X-LOSS ONLY")
-    else:
-        print(f"Config: Full FPN + 2D PE + Absolute Tokenization + {'Y-LOSS' if use_y_loss else 'X-LOSS ONLY'}")
-    print(f"Target: Loss should approach 0 if model can learn\n")
+    print(f"\nStarting V4 FULL DATASET Training...")
+    print(f"Config: P5 Only + 2D PE + Absolute Tokenization + X-LOSS ONLY")
+    print(f"Dataset: {len(dataset)} images")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Learning rate: {args.lr}")
+    print()
     
     best_loss = float('inf')
     
-    # Scheduled sampling hyper-parameters (for exposure bias mitigation)
-    ss_max_prob = 0.5          # V5: max scheduled sampling oranı (%50'ye kadar)
-    ss_start_epoch = 30        # V5: daha erken başla
-    ss_warmup_epochs = 40      # V5: ss_prob'i 0 -> ss_max_prob arası yumuşak arttır
+    # Scheduled sampling hyper-parameters
+    ss_max_prob = 0.5
+    ss_start_epoch = 30
+    ss_warmup_epochs = 40
 
-    # V5: Autoregressive rollout loss (full sequence, decaying weight)
-    ar_rollout_max_weight = 0.3    # Alt bölgede (küçük t) ağırlık
-    ar_rollout_min_weight = 0.05   # Üst bölgede (büyük t) ağırlık
+    # Autoregressive rollout loss
+    ar_rollout_max_weight = 0.3
+    ar_rollout_min_weight = 0.05
 
     for epoch in range(1, args.epochs + 1):
         lanelm.train()
@@ -329,16 +300,13 @@ def main():
         total_loss_ar = 0.0
         steps = 0
         
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
             optimizer.zero_grad()
             
             imgs = batch["inputs"].to(device)
-            if use_p5_only:
-                feats = extract_p5_feat(clrernet, imgs)
-            else:
-                feats = extract_full_fpn_feats(clrernet, imgs)
+            feats = extract_p5_feat(clrernet, imgs)
             
-            # Collect all lanes data FIRST (before forward pass)
+            # Collect all lanes data
             all_img_indices = []
             all_x_tokens = []
             all_y_tokens = []
@@ -364,58 +332,46 @@ def main():
             y_tokens = torch.stack(all_y_tokens).to(device)
             lane_ids = torch.stack(all_lane_ids).to(device)
             
-            # --- Teacher Forcing Girişleri (GT'ye göre) ---
+            # Teacher Forcing inputs
             x_in_tf = x_tokens.clone()
             x_in_tf[:, 1:] = x_tokens[:, :-1]
-            x_in_tf[:, 0] = x_tokens[:, 0]  # Başlangıç GT X
+            x_in_tf[:, 0] = x_tokens[:, 0]
             
             y_in = y_tokens.clone()
             y_in[:, 1:] = y_tokens[:, :-1]
-            y_in[:, 0] = y_tokens[:, 0]  # Başlangıç GT Y
+            y_in[:, 0] = y_tokens[:, 0]
             
-            # CRITICAL: Encode visual tokens INSIDE the training loop (fresh graph!)
+            # Encode visual tokens
             visual_tokens = lanelm.encode_visual_tokens(feats)
-            
-            # Select visual tokens for each lane
             vis_tok_batch = torch.stack([visual_tokens[i] for i in all_img_indices]).to(device)
             
-            # --- 1. Geçiş: Pure Teacher Forcing ---
+            # Pure Teacher Forcing
             logits_x_tf, logits_y_tf = lanelm(
                 vis_tok_batch, x_in_tf, y_in, lane_indices=lane_ids
             )
             
-            # Öğretmen zorlama çıktısından argmax tahminlerini kaydet (her durumda)
-            pred_x_tf = torch.argmax(logits_x_tf, dim=-1)  # (B, T)
-            B_l, T_l = x_tokens.shape  # V5: rollout ve SS için her zaman tanımlı olsun
+            pred_x_tf = torch.argmax(logits_x_tf, dim=-1)
+            B_l, T_l = x_tokens.shape
 
-            # --- Scheduled Sampling oranı hesapla ---
+            # Scheduled Sampling
             if epoch <= ss_start_epoch:
                 ss_prob = 0.0
             else:
                 if ss_warmup_epochs > 0:
-                    progress = min(
-                        1.0, float(epoch - ss_start_epoch) / float(ss_warmup_epochs)
-                    )
+                    progress = min(1.0, float(epoch - ss_start_epoch) / float(ss_warmup_epochs))
                 else:
                     progress = 1.0
                 ss_prob = ss_max_prob * progress
             
-            # --- 2. Geçiş: Scheduled Sampling ile karışık giriş (opsiyonel) ---
             if ss_prob > 0.0:
-                # x_in_ss: bazı adımlarda GT, bazı adımlarda model tahmini kullan
                 x_in_ss = x_in_tf.clone()
-                
-                # t>=1 için Bernoulli mask
                 ss_mask = (torch.rand(B_l, T_l, device=device) < ss_prob)
-                # t=0'ı teacher forcing bırak (başlangıç sabit kalsın)
                 ss_mask[:, 0] = False
                 
-                # Bir önceki adımın GT vs pred seçimi
                 gt_prev = x_tokens.clone()
                 gt_prev[:, 0] = x_tokens[:, 0]
                 pred_prev = pred_x_tf.clone()
                 
-                # t>=1'de: x_in_ss[:, t] = ss_mask ? pred_prev[:, t-1] : gt_prev[:, t-1]
                 for t_step in range(1, T_l):
                     use_pred = ss_mask[:, t_step]
                     x_in_ss[:, t_step] = torch.where(
@@ -427,63 +383,52 @@ def main():
                     vis_tok_batch, x_in, y_in, lane_indices=lane_ids
                 )
             else:
-                # Scheduled sampling yoksa TF logits'lerini kullan
                 x_in = x_in_tf
                 logits_x, logits_y = logits_x_tf, logits_y_tf
             
-            # Loss: X and Y (FIX 5: Aşamalı Y-loss)
+            # Loss calculation
             B, T, V = logits_x.shape
             loss_x = loss_x_fn(logits_x.view(B * T, V), x_tokens.view(B * T))
-            # logits_y shape: (B, T, max_y_tokens) where max_y_tokens = T+1
             
-            # FIX 5: Aşamalı Y-loss ekleme
-            # FIX 7: Y-loss weight çok düşük (0.05) çünkü Y token'ları zaten sıralı
             if epoch >= y_loss_start_epoch:
                 loss_y = loss_y_fn(logits_y.view(B * T, -1), y_tokens.view(B * T))
-                # Y-loss weight'i yavaşça artır (0.01 → 0.05)
                 if epoch < y_loss_start_epoch + y_loss_warmup_epochs:
-                    # Warmup: 0.01 → 0.05 (çok düşük!)
                     warmup_progress = (epoch - y_loss_start_epoch) / y_loss_warmup_epochs
-                    y_weight = 0.01 + 0.04 * warmup_progress  # 0.01 → 0.05
+                    y_weight = 0.01 + 0.04 * warmup_progress
                 else:
-                    y_weight = y_loss_final_weight  # Final weight (0.05)
+                    y_weight = y_loss_final_weight
                 loss = (1.0 - y_weight) * loss_x + y_weight * loss_y
             else:
-                loss = loss_x  # FIX 1: Only X-loss (ilk 100 epoch)
+                loss = loss_x
                 loss_y = torch.tensor(0.0, device=device)
             
-            # V5: Autoregressive rollout loss (full sequence, decaying weight over time)
+            # AR Rollout Loss
             ar_loss = torch.tensor(0.0, device=device)
             if ar_rollout_max_weight > 0.0 and T_l > 1:
-                # 1-step AR rollout için giriş dizisi: t>=1'de x_{t-1} = model tahmini
                 x_in_roll = x_in_tf.clone()
                 x_in_roll[:, 1:] = pred_x_tf[:, :-1]
                 logits_x_roll, _ = lanelm(
                     vis_tok_batch, x_in_roll, y_in, lane_indices=lane_ids
                 )
-                # t=0 hariç, tüm timestepler için loss
-                roll_logits = logits_x_roll[:, 1:, :].reshape(-1, V)          # (B*(T-1), V)
-                roll_targets = x_tokens[:, 1:].reshape(-1)                    # (B*(T-1),)
-                # Eleman bazlı loss (ignore_index ile)
+                roll_logits = logits_x_roll[:, 1:, :].reshape(-1, V)
+                roll_targets = x_tokens[:, 1:].reshape(-1)
                 roll_loss_all = torch.nn.functional.cross_entropy(
                     roll_logits,
                     roll_targets,
                     ignore_index=tokenizer_cfg.pad_token_x,
                     reduction="none",
                 )
-                # Zaman bazlı ağırlık maskesi: küçük t → yüksek weight, büyük t → düşük weight
-                t_ids = torch.arange(1, T_l, device=device).unsqueeze(0).expand(B_l, -1)  # (B, T-1)
-                # normalize edilmiş zaman [0,1]
+                t_ids = torch.arange(1, T_l, device=device).unsqueeze(0).expand(B_l, -1)
                 t_norm = (t_ids - 1).float() / max(T_l - 2, 1)
                 w_t = ar_rollout_min_weight + (1.0 - t_norm) * (ar_rollout_max_weight - ar_rollout_min_weight)
-                w_flat = w_t.reshape(-1)  # (B*(T-1),)
+                w_flat = w_t.reshape(-1)
                 valid_mask = roll_targets != tokenizer_cfg.pad_token_x
                 if valid_mask.any():
                     ar_loss = (roll_loss_all[valid_mask] * w_flat[valid_mask]).sum() / valid_mask.sum()
                     loss = loss + ar_loss
 
-            # V5: Padding bölgelerinde X=0 öğrenilsin (no-lane timesteps)
-            pad_mask = (y_tokens == tokenizer.T)  # padding Y
+            # Padding Loss
+            pad_mask = (y_tokens == tokenizer.T)
             pad_mask_flat = pad_mask.view(B * T)
             pad_loss = torch.tensor(0.0, device=device)
             if pad_mask_flat.any():
@@ -491,11 +436,9 @@ def main():
                 logits_x_pad = logits_x_flat[pad_mask_flat]
                 targets_pad = torch.zeros(logits_x_pad.size(0), dtype=torch.long, device=device)
                 pad_loss = loss_x_pad_fn(logits_x_pad, targets_pad)
-                # Küçük bir ağırlıkla ekle (ör. 0.3)
                 loss = loss + 0.3 * pad_loss
 
             loss.backward()
-            # FIX 2: Stricter gradient clipping (1.0 → 0.5)
             torch.nn.utils.clip_grad_norm_(lanelm.parameters(), max_norm=0.5)
             optimizer.step()
             
@@ -504,6 +447,10 @@ def main():
             total_loss_y += loss_y.item()
             total_loss_ar += ar_loss.item()
             steps += 1
+            
+            # Progress logging every 100 batches
+            if (batch_idx + 1) % 100 == 0:
+                print(f"Ep {epoch} | Batch {batch_idx+1}/{len(dataloader)} | Loss={loss.item():.4f} (X={loss_x.item():.4f} AR={ar_loss.item():.4f})")
         
         if steps > 0:
             avg_loss = total_loss / steps
@@ -511,11 +458,10 @@ def main():
             avg_loss_y = total_loss_y / steps
             avg_loss_ar = total_loss_ar / steps
             
-            # FIX 2: Update learning rate scheduler
             scheduler.step()
             current_lr = scheduler.get_last_lr()[0]
             
-            if epoch % 10 == 0 or epoch <= 5:
+            if epoch % 5 == 0 or epoch <= 3:
                 if epoch >= y_loss_start_epoch:
                     warmup_progress = min(1.0, (epoch - y_loss_start_epoch) / y_loss_warmup_epochs) if epoch < y_loss_start_epoch + y_loss_warmup_epochs else 1.0
                     y_weight = 0.01 + 0.04 * warmup_progress if epoch < y_loss_start_epoch + y_loss_warmup_epochs else y_loss_final_weight
@@ -531,8 +477,22 @@ def main():
                     "epoch": epoch,
                     "loss": best_loss
                 }, os.path.join(args.work_dir, "lanelm_v4_best.pth"))
+                print(f"  ✓ Saved best model (loss={best_loss:.4f})")
             
-            if epoch % 50 == 0:
+            # Save checkpoint every 10 epochs
+            if epoch % 10 == 0:
+                torch.save({
+                    "model_state_dict": lanelm.state_dict(),
+                    "config": hparams.__dict__,
+                    "epoch": epoch,
+                    "loss": avg_loss,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                }, os.path.join(args.work_dir, f"lanelm_v4_epoch_{epoch}.pth"))
+                print(f"  ✓ Saved checkpoint at epoch {epoch}")
+            
+            # Visualize every 10 epochs
+            if epoch % 10 == 0:
                 visualize(
                     lanelm, clrernet, fixed_batch, tokenizer, device, epoch,
                     os.path.join(args.work_dir, "vis"), hparams.max_lanes, use_p5_only
@@ -541,14 +501,6 @@ def main():
     print(f"\nTraining complete!")
     print(f"Best loss: {best_loss:.4f}")
     print(f"Model saved to {args.work_dir}/lanelm_v4_best.pth")
-    
-    # Final analysis
-    if best_loss < 0.5:
-        print("\n✅ SUCCESS: Model can learn from visual information!")
-        print("   Next step: Scale up to more images")
-    else:
-        print("\n❌ FAILURE: Model still not learning properly")
-        print("   Need to investigate further")
 
 
 if __name__ == "__main__":

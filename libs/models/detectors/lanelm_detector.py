@@ -12,59 +12,45 @@ from libs.utils.lane_utils import Lane
 def autoregressive_decode(lanelm_model, visual_tokens, tokenizer_cfg, max_lanes, temperature=0.0):
     """Greedy decode LaneLM (per-lane) with lane_indices support.
     
-    CRITICAL: This EXACTLY matches train_lanelm_v4_fixed.py visualize() function (lines 123-140):
+    CRITICAL: This EXACTLY matches train_lanelm_v4_fixed.py visual_first_decode() function (lines 113-141):
     - Uses ABSOLUTE tokenization (x_mode='absolute')
     - Uses padding token (0) for first position, NOT BOS tokens
-    - Recreates x_in_shifted at each step (matches training visualize logic)
+    - Recreates x_in at each step with EXACT same logic as training
+    - Matches training's visual_first_decode line-by-line
     """
-    device = visual_tokens.device
-    B = visual_tokens.shape[0]
+    model_device = next(lanelm_model.parameters()).device
+    B, _, _ = visual_tokens.shape
     T = tokenizer_cfg.num_steps
     pad_token_x = tokenizer_cfg.pad_token_x
 
     all_x = []
     all_y = []
     for lane_idx in range(max_lanes):
-        # Fixed y sequence (0..T-1) - matches training line 121
-        y_fixed = torch.arange(T, dtype=torch.long, device=device).unsqueeze(0).expand(B, -1).clone()
+        # Fixed y sequence (0..T-1) - EXACT match to training
+        y_fixed = torch.arange(T, dtype=torch.long, device=model_device).unsqueeze(0).expand(B, -1)
         
-        # Initialize output - matches training line 124
-        x_out = torch.zeros(B, T, dtype=torch.long, device=device)
+        # Initialize output tokens - EXACT match to training
+        x_out = torch.zeros(B, T, dtype=torch.long, device=model_device)
         
-        lane_indices = torch.full((B,), lane_idx, dtype=torch.long, device=device)
+        lane_indices = torch.full((B,), lane_idx, dtype=torch.long, device=model_device)
 
-        # Autoregressive decode X only (Y is fixed) - matches training lines 127-140
+        # Visual-first autoregressive decode - EXACT match to training visual_first_decode (lines 125-138)
         for t in range(T):
-            # CRITICAL: Match training visualize() logic (lines 128-134)
-            # Recreate x_in_shifted at each step, just like training
-            x_in = x_out.clone()
+            x_in = torch.zeros_like(x_out)
             if t > 0:
-                x_in_shifted = torch.zeros_like(x_in)
-                x_in_shifted[:, 1:t+1] = x_out[:, :t]
-            else:
-                x_in_shifted = x_in  # First step: all zeros (padding tokens)
-            
-            # Forward pass - matches training line 137
+                x_in[:, 1:t+1] = x_out[:, :t]
+                x_in[:, 0] = x_out[:, 0]  # Keep first predicted token - EXACT match to training line 129
+
             logits_x, _ = lanelm_model(
                 visual_tokens,
-                x_in_shifted,
+                x_in,
                 y_fixed,
-                None,  # visual_padding_mask
-                lane_indices,
+                lane_indices=lane_indices,
             )
-            
-            # Get prediction for current timestep - matches training line 139
-            # Training uses logits_x[0, t] for batch=1, we use logits_x[:, t, :] which is equivalent
-            # But to be EXACTLY the same, we should index [0] when B=1
-            if B == 1:
-                pred_x = torch.argmax(logits_x[0, t, :], dim=-1)  # EXACT match to training
-            else:
-                pred_x = torch.argmax(logits_x[:, t, :], dim=-1)
-            
-            # Clamp to valid range
+
+            # EXACT match to training line 137
+            pred_x = torch.argmax(logits_x[:, t, :], dim=-1)
             pred_x = pred_x.clamp(0, lanelm_model.nbins_x - 1)
-            
-            # Store prediction - matches training line 140
             x_out[:, t] = pred_x
 
         all_x.append(x_out.cpu())

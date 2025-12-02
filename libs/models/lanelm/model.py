@@ -20,12 +20,16 @@ class KeypointEmbedding(nn.Module):
         max_y_tokens: int,
         embed_dim: int,
         max_len: int,
+        x_embedding_scale: float = 1.0,  # V5: Scale factor for X embedding (reduce dependency on past X)
+        lane_embedding_boost: float = 10.0,  # V5: Boost factor for lane embedding (emphasize visual info)
     ) -> None:
         super().__init__()
         self.nbins_x = nbins_x
         self.max_y_tokens = max_y_tokens
         self.embed_dim = embed_dim
         self.max_len = max_len
+        self.x_embedding_scale = x_embedding_scale  # V5: Default 1.0, V5 uses 0.3
+        self.lane_embedding_boost = lane_embedding_boost  # V5: Default 10.0, V5 uses 15.0
 
         self.x_embedding = nn.Embedding(nbins_x, embed_dim)
         self.y_embedding = nn.Embedding(max_y_tokens, embed_dim)
@@ -74,7 +78,8 @@ class KeypointEmbedding(nn.Module):
         device = x_tokens.device
         pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
-        x_emb = self.x_embedding(x_tokens)
+        # V5: Scale X embedding to reduce dependency on past X tokens
+        x_emb = self.x_embedding(x_tokens) * self.x_embedding_scale
         y_emb = self.y_embedding(y_tokens)
         pos_emb = self.pos_embedding(pos_ids)
 
@@ -86,8 +91,9 @@ class KeypointEmbedding(nn.Module):
                 lane_indices = lane_indices.unsqueeze(1).expand(-1, seq_len)
             
             lane_emb = self.lane_embedding(lane_indices)
-            # Signal Boosting: Multiply Lane Embedding by 10.0 to force attention
-            out = out + (lane_emb * 10.0)
+            # V5: Boost Lane Embedding to emphasize visual information
+            # Original: 10.0, V5: 15.0 (stronger signal for which lane to predict)
+            out = out + (lane_emb * self.lane_embedding_boost)
 
         return out
 
@@ -113,11 +119,15 @@ class VisualTokenEncoder(nn.Module):
         in_channels: Sequence[int],
         embed_dim: int,
         use_2d_pe: bool = True,  # NEW: Enable 2D positional embedding
+        use_adaptive_pooling: bool = True,  # V5: Adaptive spatial pooling to reduce tokens
+        target_spatial_size: Optional[Tuple[int, int]] = None,  # V5: Target (H, W) for pooling
     ) -> None:
         super().__init__()
         self.in_channels = list(in_channels)
         self.embed_dim = embed_dim
         self.use_2d_pe = use_2d_pe
+        self.use_adaptive_pooling = use_adaptive_pooling
+        self.target_spatial_size = target_spatial_size
 
         # Per-level LayerNorm + linear projection to embed_dim
         # LayerNorm is critical because CLRerNet FPN outputs have large variance!
@@ -127,6 +137,15 @@ class VisualTokenEncoder(nn.Module):
         self.proj_per_level = nn.ModuleList(
             [nn.Linear(c, embed_dim) for c in self.in_channels]
         )
+
+        # V5: Adaptive pooling per level (if enabled)
+        if use_adaptive_pooling and target_spatial_size is not None:
+            self.adaptive_pool_per_level = nn.ModuleList([
+                nn.AdaptiveAvgPool2d(target_spatial_size)
+                for _ in self.in_channels
+            ])
+        else:
+            self.adaptive_pool_per_level = None
 
         # Level embeddings (encode which FPN level a token comes from)
         self.level_embed = nn.Embedding(len(self.in_channels), embed_dim)
@@ -146,6 +165,8 @@ class VisualTokenEncoder(nn.Module):
         
         This preserves spatial structure by encoding (x, y) positions separately
         and concatenating them, similar to ViT and DETR.
+        
+        V5 Enhancement: Stronger frequency bands and scaling for better spatial awareness.
         
         Returns: (H*W, embed_dim) tensor
         """
@@ -167,20 +188,40 @@ class VisualTokenEncoder(nn.Module):
         y_grid = y_grid.reshape(-1)  # (H*W,)
         x_grid = x_grid.reshape(-1)  # (H*W,)
         
-        # Frequency bands (similar to Transformer positional encoding)
-        freq_bands = torch.arange(half_dim // 2, device=device, dtype=torch.float32)
-        freq_bands = 1.0 / (10000 ** (2 * freq_bands / half_dim))
+        # V5: Stronger frequency bands - use more frequency components
+        # Original: half_dim // 2 frequencies
+        # Enhanced: Use more frequencies for better spatial resolution
+        num_freqs = half_dim // 2
+        freq_bands = torch.arange(num_freqs, device=device, dtype=torch.float32)
+        # V5: Scale factor for stronger positional signal
+        freq_scale = 2.0  # Increase frequency strength
+        freq_bands = freq_scale / (10000 ** (2 * freq_bands / num_freqs))
         
         # Compute sin/cos embeddings for x and y
-        x_embed = x_grid.unsqueeze(-1) * freq_bands.unsqueeze(0) * 3.14159  # (H*W, half_dim//2)
-        y_embed = y_grid.unsqueeze(-1) * freq_bands.unsqueeze(0) * 3.14159  # (H*W, half_dim//2)
+        x_embed = x_grid.unsqueeze(-1) * freq_bands.unsqueeze(0) * 3.14159  # (H*W, num_freqs)
+        y_embed = y_grid.unsqueeze(-1) * freq_bands.unsqueeze(0) * 3.14159  # (H*W, num_freqs)
         
         # Interleave sin and cos
-        x_pe = torch.stack([x_embed.sin(), x_embed.cos()], dim=-1).reshape(-1, half_dim)  # (H*W, half_dim)
-        y_pe = torch.stack([y_embed.sin(), y_embed.cos()], dim=-1).reshape(-1, half_dim)  # (H*W, half_dim)
+        x_pe = torch.stack([x_embed.sin(), x_embed.cos()], dim=-1).reshape(-1, num_freqs * 2)  # (H*W, num_freqs*2)
+        y_pe = torch.stack([y_embed.sin(), y_embed.cos()], dim=-1).reshape(-1, num_freqs * 2)  # (H*W, num_freqs*2)
+        
+        # V5: If half_dim > num_freqs*2, pad with zeros or repeat
+        if half_dim > num_freqs * 2:
+            # Repeat to fill half_dim
+            repeat_factor = (half_dim + num_freqs * 2 - 1) // (num_freqs * 2)
+            x_pe = x_pe.repeat(1, repeat_factor)[:, :half_dim]
+            y_pe = y_pe.repeat(1, repeat_factor)[:, :half_dim]
+        elif half_dim < num_freqs * 2:
+            # Truncate if needed
+            x_pe = x_pe[:, :half_dim]
+            y_pe = y_pe[:, :half_dim]
         
         # Concatenate x and y embeddings
         pos_embed = torch.cat([x_pe, y_pe], dim=-1)  # (H*W, embed_dim)
+        
+        # V5: Scale positional embedding for stronger signal
+        pos_scale = 1.5  # Boost positional signal strength
+        pos_embed = pos_embed * pos_scale
         
         return pos_embed
 
@@ -210,6 +251,12 @@ class VisualTokenEncoder(nn.Module):
                     f"Unexpected channels at level {lvl}: "
                     f"got {C}, expected {self.in_channels[lvl]}."
                 )
+
+            # V5: Apply adaptive pooling if enabled
+            if self.adaptive_pool_per_level is not None:
+                pool = self.adaptive_pool_per_level[lvl]
+                feat = pool(feat)  # (B, C, H_target, W_target)
+                H, W = feat.shape[2], feat.shape[3]
 
             # (B, C, H, W) -> (B, H*W, C)
             x = feat.view(B, C, H * W).permute(0, 2, 1).contiguous()
@@ -260,15 +307,18 @@ class LaneLMDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
 
+        # V5: Self-attention with higher dropout to reduce past X dependency
         self.self_attn = nn.MultiheadAttention(
             embed_dim,
             num_heads,
-            dropout=dropout,
+            dropout=max(dropout, 0.2),  # V5: Minimum 0.2 dropout for self-attention
             batch_first=True,
         )
+        # V5: Cross-attention with more heads for stronger visual information
+        cross_attn_heads = num_heads * 2 if num_heads < 16 else num_heads  # Double heads if < 16
         self.cross_attn = nn.MultiheadAttention(
             embed_dim,
-            num_heads,
+            cross_attn_heads,
             dropout=dropout,
             batch_first=True,
         )
@@ -295,8 +345,23 @@ class LaneLMDecoderLayer(nn.Module):
         - memory: (B, N, D) visual tokens
         - tgt_mask: (T, T) causal mask (True for masked positions)
         - memory_key_padding_mask: (B, N) mask for visual tokens
+        
+        V5: Visual-First Decoder - Cross-attention FIRST, then self-attention
+        This makes visual information primary and reduces dependency on past X tokens.
         """
-        # Self-attention (causal)
+        # V5: Cross-attention FIRST (visual information is primary)
+        residual = tgt
+        attn_out, attn_weights = self.cross_attn(
+            tgt,
+            memory,
+            memory,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=True,  # Keep weights for debugging
+        )
+        # V5: Visual-Query Fusion - add cross-attention output to original query
+        tgt = self.norm1(residual + self.dropout(attn_out))
+
+        # V5: Self-attention SECOND (weakened, with higher dropout)
         residual = tgt
         attn_out, _ = self.self_attn(
             tgt,
@@ -305,18 +370,11 @@ class LaneLMDecoderLayer(nn.Module):
             attn_mask=tgt_mask,
             need_weights=False,
         )
-        tgt = self.norm1(residual + self.dropout(attn_out))
-
-        # Cross-attention (image → language)
-        residual = tgt
-        attn_out, _ = self.cross_attn(
-            tgt,
-            memory,
-            memory,
-            key_padding_mask=memory_key_padding_mask,
-            need_weights=False,
-        )
-        tgt = self.norm2(residual + self.dropout(attn_out))
+        # V5: Higher dropout for self-attention to reduce past X dependency
+        tgt = self.norm2(residual + self.dropout(attn_out * 0.8))  # Scale down self-attention
+        
+        # Store attention weights for debugging (if needed)
+        # attn_weights shape: (B, num_heads, T, N) where N is num visual tokens
 
         # Feed-forward
         residual = tgt
@@ -469,9 +527,17 @@ class LaneLMModel(nn.Module):
         self.visual_encoder: Optional[VisualTokenEncoder]
         if visual_in_channels is not None:
             # Multi-level FPN features -> tokens
+            # V5: Use adaptive pooling for P5-only to reduce tokens (250 -> 65)
+            # For P5: (10, 25) -> (5, 13) = 65 tokens
+            use_adaptive_pooling = len(visual_in_channels) == 1  # Only for single-level (P5-only)
+            target_spatial_size = (5, 13) if use_adaptive_pooling else None
+            
             self.visual_encoder = VisualTokenEncoder(
                 in_channels=visual_in_channels,
                 embed_dim=embed_dim,
+                use_2d_pe=True,
+                use_adaptive_pooling=use_adaptive_pooling,
+                target_spatial_size=target_spatial_size,
             )
             self.visual_proj = None
         else:
@@ -484,11 +550,14 @@ class LaneLMModel(nn.Module):
             else:
                 self.visual_proj = None
 
+        # V5: Keypoint Embedding with reduced X dependency and boosted lane signal
         self.keypoint_embed = KeypointEmbedding(
             nbins_x=nbins_x,
             max_y_tokens=max_y_tokens,
             embed_dim=embed_dim,
             max_len=max_seq_len,
+            x_embedding_scale=0.3,  # V5: Reduce past X dependency (1.0 -> 0.3)
+            lane_embedding_boost=15.0,  # V5: Boost lane signal (10.0 -> 15.0)
         )
         self.decoder = LaneLMDecoder(
             num_layers=num_layers,
