@@ -88,20 +88,48 @@ LaneLM modelini MMEngine framework'ü ile uyumlu hale getirmek ve CULane dataset
 
 ### Test Sonuçları (100 görüntü, test_valid_gt_100.txt)
 
-**IoU Threshold = 0.1:**
-- Precision: 0.2450
-- Recall: 0.3267
-- F1: 0.2800
+**ÖNCEKİ KOŞU (test_valid_gt_100.txt, eski checkpoint)**  
 
-**IoU Threshold = 0.5:**
-- Precision: 0.0000
-- Recall: 0.0000
-- **F1: 0.0000** ❌
+- **IoU Threshold = 0.1:**
+  - Precision: 0.2450
+  - Recall: 0.3267
+  - F1: 0.2800
 
-**IoU Threshold = 0.75:**
-- Precision: 0.0000
-- Recall: 0.0000
-- F1: 0.0000
+- **IoU Threshold = 0.5:**
+  - Precision: 0.0000
+  - Recall: 0.0000
+  - **F1: 0.0000** ❌
+
+- **IoU Threshold = 0.75:**
+  - Precision: 0.0000
+  - Recall: 0.0000
+  - F1: 0.0000
+
+---
+
+**YENİ KOŞU (2025-12-04, test_100.txt, V6 + 8-image overfit checkpoint)**  
+
+- **Eğitim tarafı:**  
+  - `train_lanelm_v4_fixed.py --epochs 200 --overfit-size 8`  
+  - 8 görsele **tam overfit**: `best loss ≈ 0.0057` (X≈0.0048, AR≈0.0008, PRES≈1e-4, PIX=0, Y-loss kapalı)
+  - Bu, modelin görsel bilgiyi ve token uzayını çok güçlü şekilde ezberleyebildiğini gösteriyor.
+
+- **Test tarafı (`configs/lanelm/lanelm_v4_culane_test.py`, `test_100.txt`):**
+  - **IoU Threshold = 0.1:**
+    - `test_all`: TP=144, FP=256, FN=63 → Precision=0.3600, Recall=0.6957, **F1=0.4745**
+  - **IoU Threshold = 0.5:**
+    - `test_all`: TP=4, FP=396, FN=203 → Precision=0.0100, Recall=0.0193, **F1=0.0132**
+  - **IoU Threshold = 0.75:**
+    - `test_all`: TP=0, FP=400, FN=207 → **F1=0.0000**
+
+- **Yorum:**  
+  - 0.1 IoU’da F1’in 0.47’ye çıkması, tahminlerin **doğru şerit bölgesine** kabaca oturduğunu gösteriyor (artık “tamamen alakasız” değiller).  
+  - Ancak 0.5 ve 0.75’te F1’in yine neredeyse sıfır olması, **şekil/jeometri uyumsuzluğunun** hâlâ ciddi olduğunu gösteriyor:
+    - Şeritler GT ile aynı bölgede ama:
+      - X-ekseni boyunca küçük zigzag / jitter,
+      - Y boyunca örnekleme farkları ve spline tabanlı lane temsil farkı,
+      - 30px mask genişliği altında, bu jitter birikerek IoU’yu hızlıca 0.5 altına düşürüyor.
+  - Özetle: **eğitimde aşırı güçlü ezber var (8 görselde mükemmel overfit), ama CULane IoU@0.5 metriği halen “şekil/akışkanlık” açısından cezalandırıyor.**
 
 ### Prediction Kalitesi Analizi
 

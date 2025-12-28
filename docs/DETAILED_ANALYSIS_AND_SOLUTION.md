@@ -306,3 +306,10 @@ print(f"Gradient norm: {total_norm}")
 
 **Sonraki Adım:** P5 Only ile başarılı olduktan sonra, Full FPN'i subsample ederek geri ekleyebiliriz.
 
+
+
+
+
+
+
+

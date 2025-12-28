@@ -115,3 +115,10 @@ loss = 0.5 * loss_x + 0.5 * loss_y  # Veya 0.7 * loss_x + 0.3 * loss_y
 
 **2k script'i kullanma** - Relative tokenization sorunlu.
 
+
+
+
+
+
+
+

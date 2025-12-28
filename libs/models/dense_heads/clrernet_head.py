@@ -47,12 +47,27 @@ class CLRerHead(BaseDenseHead):
         self.n_offsets = self.anchor_generator.num_offsets
         self.n_strips = self.n_offsets - 1
         self.strip_size = self.img_h / self.n_strips
-        self.num_priors = attention.num_priors = self.anchor_generator.num_priors
-        self.sample_points = attention.sample_points = sample_points
-        self.refine_layers = attention.refine_layers = refine_layers
-        self.fc_hidden_dim = attention.fc_hidden_dim = fc_hidden_dim
-        self.prior_feat_channels = attention.in_channels = prior_feat_channels
+        self.num_priors = self.anchor_generator.num_priors
+        self.prior_feat_channels = prior_feat_channels
+
+        # Update attention config with required parameters before building
+        if isinstance(attention, dict):
+            attention = dict(attention)  # Make a copy to avoid modifying original
+            attention.update({
+                'in_channels': prior_feat_channels,
+                'num_priors': self.num_priors,
+                'sample_points': sample_points,
+                'fc_hidden_dim': fc_hidden_dim,
+                'refine_layers': refine_layers,
+            })
+
+        # Build attention object with required parameters
         self.attention = MODELS.build(attention)
+
+        # Set local convenience variables
+        self.sample_points = sample_points
+        self.refine_layers = refine_layers
+        self.fc_hidden_dim = fc_hidden_dim
         self.loss_cls = MODELS.build(loss_cls)
         self.loss_bbox = MODELS.build(loss_bbox)
         self.loss_seg = MODELS.build(loss_seg) if loss_seg["loss_weight"] > 0 else None

@@ -113,3 +113,10 @@ loss = 0.5 * loss_x + 0.5 * loss_y  # X ve Y eşit ağırlık
 3. Full dataset ile eğitim yapın (train_gt.txt)
 4. Test edin (test.txt)
 
+
+
+
+
+
+
+

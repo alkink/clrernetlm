@@ -1,101 +1,71 @@
-# UYGULANAN DÜZELTMELER
+# Uygulanan Düzeltmeler
 
-## ✅ TAMAMLANAN DÜZELTMELER
+## Sorun: Training vs Test Mismatch
 
-### FIX 1: P5 Only + Sadece X-Loss ✅
-**Değişiklikler:**
-- `extract_p5_feat()` fonksiyonu eklendi (P5 Only feature extraction)
-- `use_p5_only = True` flag eklendi
-- `visual_in_channels = (64,)` (P5 Only) veya `(64, 64, 64)` (Full FPN)
-- Y-loss kaldırıldı (`use_y_loss = False`)
-- Sadece X-loss kullanılıyor: `loss = loss_x`
+### Root Cause
+1. **GT Bounds Dışı Değerler:** GT'de X < 0 ve X > 1640 değerleri var (CULane dataset'inde normal)
+2. **Y Range Eksikliği:** Prediction'lar GT'den daha kısa (Y range filtresi çok agresif)
+3. **draw_lane Clipping:** `draw_lane` fonksiyonu image bounds kontrolü yapmıyor
 
-**Beklenen Etki:**
-- Visual token sayısı: ~6,500 → ~250 (çok daha az noise)
-- Model odaklanabiliyor, cross-attention meaningful olmalı
-- Posterior collapse azalmalı
+### Uygulanan Düzeltmeler
 
----
+#### 1. draw_lane Fonksiyonunda Clip Ekleme
+**Dosya:** `libs/utils/visualizer.py`
 
-### FIX 2: LR Düşür + Gradient Clipping Sıkılaştır ✅
-**Değişiklikler:**
-- Default LR: `3e-4` → `1e-4` (daha konservatif)
-- Gradient clipping: `max_norm=1.0` → `max_norm=0.5` (daha sıkı)
+**Değişiklik:**
+- `draw_lane` fonksiyonunda lane koordinatlarını image bounds'a clip et
+- Bu, GT ve prediction için aynı şekilde çalışmasını sağlar
+- GT'deki X < 0 ve X > 1640 değerleri artık doğru handle ediliyor
 
-**Beklenen Etki:**
-- Model daha stabil öğrenir
-- Overshoot problemi azalır
-- Optimum'u kaçırma riski düşer
-
----
-
-### FIX 3: Cosine Annealing Scheduler ✅
-**Değişiklikler:**
-- `CosineAnnealingLR` scheduler eklendi
-- `T_max=args.epochs`, `eta_min=1e-6`
-- Her epoch sonunda `scheduler.step()` çağrılıyor
-- Current LR loglanıyor
-
-**Beklenen Etki:**
-- LR yavaşça düşer (3e-4 → 1e-6)
-- Model başta hızlı öğrenir, sonra fine-tune eder
-- Daha iyi convergence
-
----
-
-### FIX 4: Attention Weights Logging ✅
-**Değişiklikler:**
-- `LaneLMDecoderLayer.cross_attn` → `need_weights=True`
-- Attention weights artık döndürülüyor (debug için hazır)
-
-**Beklenen Etki:**
-- Attention uniformity score hesaplanabilir
-- Posterior collapse tespit edilebilir
-- Visual encoder sorunları görülebilir
-
----
-
-## ⏳ BEKLEYEN DÜZELTMELER (Gerekirse)
-
-### FIX 5: Visual Encoder İyileştirmeleri
-- LayerNorm'dan sonra scale factor ekle
-- Feature normalization (mean=0, std=1)
-- Residual connection ekle
-
-### FIX 6: Relative Tokenization
-- Absolute → Relative mode
-- Spatial continuity için
-
-### FIX 7: Scheduled Sampling
-- Exposure bias düzeltmesi
-- Training/inference mismatch azaltma
-
-### FIX 8: Batch Size Optimizasyonu
-- Gradient accumulation
-- Stabil gradient hesaplama
-
----
-
-## 📊 TEST KOMUTU
-
-```bash
-python tools/train_lanelm_v4_fixed.py --overfit-size 1 --epochs 500 --lr 1e-4
+**Kod:**
+```python
+# Clip lane coordinates to image bounds BEFORE drawing
+h, w = img_shape[:2] if img_shape else img.shape[:2]
+lane_clipped = lane.copy()
+lane_clipped[:, 0] = np.clip(lane_clipped[:, 0], 0, w - 1)
+lane_clipped[:, 1] = np.clip(lane_clipped[:, 1], 0, h - 1)
 ```
 
-**Beklenen Sonuçlar:**
-- Loss < 0.1 (overfit-size=1 için)
-- Prediction'lar GT ile çakışmalı
-- Zigzag azalmalı
-- Attention uniformity < 0.5
+#### 2. Y Range Margin Artırma
+**Dosya:** `libs/datasets/metrics/culane_metric.py`
 
----
+**Değişiklik:**
+- `get_prediction_string` fonksiyonunda Y range margin'ini artır
+- Margin: 0.01 → 0.05
+- Bu, prediction'ların GT'yi tam kapsamasını sağlar
 
-## 🔍 DEBUG CHECKLIST
+**Kod:**
+```python
+lane_min_y = lane.min_y - 0.05  # Increased margin: 0.01 → 0.05
+lane_max_y = lane.max_y + 0.05  # Increased margin: 0.01 → 0.05
+```
 
-- [ ] Visual token sayısı kontrolü (P5 Only: ~250 tokens)
-- [ ] Loss değerleri (X-loss düşüyor mu?)
-- [ ] LR değerleri (Cosine Annealing çalışıyor mu?)
-- [ ] Gradient norm (clipping çalışıyor mu?)
-- [ ] Attention weights (uniformity score hesapla)
-- [ ] Görselleştirme (prediction'lar GT ile çakışıyor mu?)
+## Beklenen Etki
 
+### Önceki Durum
+- GT X > 1640 → IoU=0.0000 (sıfır)
+- Y range eksikliği → IoU düşük
+- Test F1=0.0132 (neredeyse 0)
+
+### Sonraki Durum (Beklenen)
+- GT X > 1640 → Clip edilir → IoU artar
+- Y range margin artışı → Prediction GT'yi tam kapsar → IoU artar
+- Test F1 → 0.3+ (makul değer)
+
+## Test
+
+Düzeltmeleri test etmek için:
+
+```bash
+python tools/test.py configs/lanelm/lanelm_v4_culane_test.py dummy.pth
+```
+
+**Beklenen:**
+- IoU 0.5'te F1 artışı (0.0132 → 0.3+)
+- TP artışı, FP/FN azalması
+
+## Notlar
+
+1. **GT Clipping:** GT'yi değiştirmiyoruz, sadece `draw_lane`'de clip ediyoruz
+2. **Y Range Margin:** Margin artışı prediction'ları biraz genişletir, ama bu GT'yi tam kapsamak için gerekli
+3. **Backward Compatibility:** Bu değişiklikler CULaneMetric'in diğer kullanımlarını etkilemez

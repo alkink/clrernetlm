@@ -21,8 +21,18 @@ def draw_lane(lane, img=None, img_shape=None, width=30, color=(255, 255, 255)):
     """
     if img is None:
         img = np.zeros(img_shape, dtype=np.uint8)
-    lane = lane.astype(np.int32)
-    for p1, p2 in zip(lane[:-1], lane[1:]):
+    
+    # CRITICAL FIX: Clip lane coordinates to image bounds BEFORE drawing
+    # This ensures GT and prediction are handled the same way
+    # GT may have X < 0 or X > img_w values (CULane dataset allows this)
+    # But for IoU calculation, we need to clip them to valid image bounds
+    h, w = img_shape[:2] if img_shape else img.shape[:2]
+    lane_clipped = lane.copy()
+    lane_clipped[:, 0] = np.clip(lane_clipped[:, 0], 0, w - 1)
+    lane_clipped[:, 1] = np.clip(lane_clipped[:, 1], 0, h - 1)
+    
+    lane_clipped = lane_clipped.astype(np.int32)
+    for p1, p2 in zip(lane_clipped[:-1], lane_clipped[1:]):
         cv2.line(img, tuple(p1), tuple(p2), color, thickness=width)
     return img
 

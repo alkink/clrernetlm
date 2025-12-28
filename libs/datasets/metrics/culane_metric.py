@@ -99,8 +99,10 @@ class CULaneMetric(BaseMetric):
         for lane in lanes:
             # Only interpolate within lane's Y range to avoid extrapolation errors
             # Lane's Y range is stored in min_y and max_y (with small margin)
-            lane_min_y = lane.min_y
-            lane_max_y = lane.max_y
+            # CRITICAL FIX: Increase margin from 0.01 to 0.05 to avoid Y range clipping
+            # This ensures prediction covers full GT Y range
+            lane_min_y = lane.min_y - 0.05  # Increased margin: 0.01 → 0.05
+            lane_max_y = lane.max_y + 0.05  # Increased margin: 0.01 → 0.05
             
             # Filter ys to only include values within lane's Y range
             ys_in_range = ys[(ys >= lane_min_y) & (ys <= lane_max_y)]

@@ -20,25 +20,27 @@ model = dict(
     neck=dict(type='CLRerNetFPN', in_channels=[128, 256, 512], out_channels=64, num_outs=3),
     clrernet_checkpoint='clrernet_culane_dla34_ema.pth',
     lanelm_cfg=dict(
-        nbins_x=200,  # CRITICAL: Must match training (train_lanelm_v4_fixed.py)
+        nbins_x=800,  # V7: PDF standard (line 570: "800 nbins and 100 training epochs")
+        # NOTE: Model must be retrained with nbins_x=800 to match this config
         max_y_tokens=41,
-        embed_dim=256,
-        num_layers=4,
+        embed_dim=512,  # V17: PDF'de LaneLM-512 (DLA34) için 512 (önceden 256 yanlıştı!)
+        num_layers=3,  # V15: PDF'ye göre 3 layers (line 382: "consists of 3 layers of LaneLM blocks")
         num_heads=8,
         ffn_dim=512,
         max_seq_len=80,
-        # BU TEST KONFİGİ İÇİN: P5-Only LaneLM (train_lanelm_v4_fixed.py) kullanıyoruz
-        # Eğitimde visual_in_channels=(64,) (sadece P5) idi, burada da aynısını kullanmalıyız.
-        visual_in_channels=(64,),
+        # V18: PDF'de Full FPN (P3+P4+P5) kullanılıyor (Line 344-365, Table 5)
+        # PDF Ablation Study: FPN yok: 68.36, FPN var: 70.71 (+2.35 F1!)
+        # Eğitimde visual_in_channels=(64, 64, 64) (Full FPN) kullanılıyor, burada da aynısını kullanmalıyız.
+        visual_in_channels=(64, 64, 64),  # V18: Full FPN (P3+P4+P5)
         # TEST EDİLECEK MODEL: 1-image overfit + V5 mimarisi (work_dirs/lanelm_v4_fixed)
-        ckpt_path='work_dirs/lanelm_v4_fixed/lanelm_v4_best.pth',
+        ckpt_path='work_dirs/v22_overfit1_0kp/lanelm_v4_best.pth',
     ),
     tokenizer_cfg=dict(
         img_w=800,
         img_h=320,
         num_steps=40,
-        nbins_x=200,  # CRITICAL: Must match training (train_lanelm_v4_fixed.py line 204)
-        x_mode='absolute',  # CRITICAL: Must match training (train_lanelm_v4_fixed.py line 224)
+        nbins_x=800,  # V7: PDF standard (must match training)
+        x_mode='absolute',  # CRITICAL: Must match training (train_lanelm_v4_fixed.py line 236)
     ),
     decode_cfg=dict(
         max_lanes=4,
@@ -48,6 +50,11 @@ model = dict(
         ori_img_h=590,
         img_w=800,
         img_h=320,
+        # V25: Overfit / debug checkpoint'lerinde presence head genelde eğitilmedi (presence_weight=0).
+        # Bu durumda presence_filter rastgele lane eler ve görselleri bozar. Debug için kapalı tut.
+        use_presence_filter=False,
+        presence_threshold=0.3,
+        use_prompting=False,  # V20A: 0-kp test, prompting kapalı
     ),
     test_cfg=dict(),
     train_cfg=dict(),
@@ -59,7 +66,7 @@ test_dataloader = dict(
     persistent_workers=True,  # Keep workers alive between epochs
     dataset=dict(
         data_root='dataset',
-        data_list='dataset/list/train_100.txt',  # 100 training images - simpler, model has seen these
+        data_list='dataset/list/test_100.txt',  # 100 images - quick test subset
         test_mode=True,
     ),
     sampler=dict(type='DefaultSampler', shuffle=False),
@@ -69,9 +76,9 @@ test_dataloader = dict(
 test_evaluator = dict(
     type='CULaneMetric',
     data_root='dataset',
-    data_list='dataset/list/train_100.txt',  # 100 training images - simpler, model has seen these
+    data_list='dataset/list/test_100.txt',  # 100 images - quick test subset
     # Bu konfig: lanelm_v4_fixed checkpoint'i için sonuçları ayrı klasöre yazar
-    result_dir='work_dirs/lanelm_v4_test_train100/predictions',
+    result_dir='work_dirs/lanelm_v4_test_fixed_100/predictions',
     use_parallel=True,  # Enable parallel for faster evaluation on large dataset
 )
 

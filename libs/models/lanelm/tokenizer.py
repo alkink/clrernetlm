@@ -26,6 +26,18 @@ class LaneTokenizerConfig:
     #                in pixel space, clipped to [-max_abs_dx, max_abs_dx].
     x_mode: str = "absolute"
     max_abs_dx: int = 64  # used only when x_mode == "relative"
+    # Optional EOS stop control for inference-time decoding loops
+    enable_eos_stop: bool = False
+    eos_consecutive: int = 2
+    eos_min_t: int = 5
+    eos_min_valid: int = 2
+    # Vertical sampling direction:
+    # - "top_to_bottom": t=0 is y=0 (top), t increases downward
+    # - "bottom_to_top": t=0 is near bottom, t increases upward
+    #
+    # This matters for causal decoding & prompting: prompts injected at later t
+    # cannot influence earlier steps.
+    y_direction: str = "top_to_bottom"
 
 
 class LaneTokenizer:
@@ -46,9 +58,14 @@ class LaneTokenizer:
         return self.cfg.num_steps
 
     def _compute_sample_ys(self) -> np.ndarray:
-        """Uniformly spaced y positions from top (0) to bottom (img_h)."""
-        # Use linspace with endpoint=False to get T positions in [0, img_h)
-        return np.linspace(0.0, float(self.cfg.img_h), num=self.cfg.num_steps, endpoint=False)
+        """Uniformly spaced y positions according to `cfg.y_direction`."""
+        ys = np.linspace(0.0, float(self.cfg.img_h), num=self.cfg.num_steps, endpoint=False)
+        direction = (self.cfg.y_direction or "top_to_bottom").lower()
+        if direction in ["top_to_bottom", "top-bottom", "t2b", "down"]:
+            return ys
+        if direction in ["bottom_to_top", "bottom-top", "b2t", "up"]:
+            return ys[::-1]
+        raise ValueError(f"Unsupported y_direction: {self.cfg.y_direction!r}")
 
     def _fit_spline(self, points: np.ndarray):
         """Fit a 1D function x(y) using the provided lane points."""
@@ -60,7 +77,13 @@ class LaneTokenizer:
         order = np.argsort(points[:, 1])
         points = points[order]
 
-        from scipy.interpolate import InterpolatedUnivariateSpline
+        # NOTE: InterpolatedUnivariateSpline (cubic) can overshoot badly on sparse/noisy
+        # lane annotations, producing huge out-of-bounds x values. This creates many
+        # padding holes during encoding and causes "zigzag / big cross" artifacts when
+        # decoding and connecting sparse points.
+        #
+        # Prefer a shape-preserving interpolator (PCHIP). Fall back to linear interp.
+        from scipy.interpolate import PchipInterpolator, interp1d
 
         # Require at least two points to define a lane
         if len(points) < 2:
@@ -70,6 +93,9 @@ class LaneTokenizer:
         y = points[:, 1]
         # Clamp y to valid range
         y = np.clip(y, 0.0, float(self.cfg.img_h - 1))
+        # Clamp x to valid range BEFORE fitting to reduce overshoot from out-of-bound
+        # annotations (e.g. slightly negative x or > img_w).
+        x = np.clip(x, 0.0, float(self.cfg.img_w - 1))
 
         # Remove duplicate y values to ensure strictly increasing
         # Keep the first x value for each unique y
@@ -81,13 +107,15 @@ class LaneTokenizer:
         if len(y) < 2:
             return None
 
-        # Spline over y -> x
-        spline = InterpolatedUnivariateSpline(
-            y,
-            x,
-            k=min(3, len(y) - 1),
-        )
-        return spline
+        # Shape-preserving interpolation over y -> x (no oscillatory overshoot)
+        if len(y) >= 3:
+            try:
+                return PchipInterpolator(y, x, extrapolate=True)
+            except Exception:
+                pass
+
+        # Linear fallback
+        return interp1d(y, x, kind="linear", fill_value="extrapolate", assume_sorted=True)
 
     def encode_single_lane(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Encode a single lane polyline into (x_tokens, y_tokens).
@@ -110,32 +138,24 @@ class LaneTokenizer:
         if spline is None:
             return x_tokens, y_tokens
 
-        # Evaluate spline at all sample_ys
+        # Evaluate interpolator at all sample_ys
         xs = spline(sample_ys)
+        # Only trust within vertical support of the original GT points (no extrapolation targets)
+        y_pts = np.asarray(points, dtype=np.float32)[:, 1]
+        y_pts = np.clip(y_pts, 0.0, float(self.cfg.img_h - 1))
+        y_min = float(np.min(y_pts))
+        y_max = float(np.max(y_pts))
 
         # Absolute x mode: identical to original behavior BUT with a critical fix:
         # we only trust the spline within the vertical support of the original GT points.
         # Outside [y_min, y_max] we KEEP padding so the model is NOT forced to
         # hallucinate lanes where there is no annotation (e.g. near the car hood).
         if self.cfg.x_mode == "absolute":
-            # Compute valid vertical range from raw GT points (in pixel space)
-            # points[:, 1] is y in pixels.
-            if points.shape[0] > 0:
-                y_min = float(points[:, 1].min())
-                y_max = float(points[:, 1].max())
-            else:
-                y_min, y_max = 0.0, float(self.cfg.img_h)
-
             for t in range(self.T):
                 y_sample = float(sample_ys[t])
-
-                # NEW: Skip samples outside the annotated vertical support.
-                # This prevents extrapolation-induced zigzag in regions where
-                # the GT does not actually define a lane (e.g. near the bumper).
+                # Outside GT vertical support -> keep padding
                 if y_sample < y_min or y_sample > y_max:
-                    # Leave padding tokens as-is.
                     continue
-
                 x = float(xs[t])
                 # Check if the point lies inside the image horizontally
                 if x < 0.0 or x >= float(self.cfg.img_w):
@@ -247,6 +267,7 @@ class LaneTokenizer:
 
                 # De-quantize x
                 x = x_tok / max(1, self.cfg.nbins_x - 1) * (self.cfg.img_w - 1)
+                # Y sabit satır (t) kullan - inference ile training uyumu
                 y = sample_ys[t]
                 xs.append(float(x))
                 ys.append(float(y))
@@ -295,6 +316,7 @@ class LaneTokenizer:
 
                     current_x += float(dx_int)
 
+                # Y sabit satır (t) kullan - inference ile training uyumu
                 y = sample_ys[t]
                 xs.append(float(current_x))
                 ys.append(float(y))
@@ -306,6 +328,9 @@ class LaneTokenizer:
 
         coords = np.stack([xs, ys], axis=1).astype(np.float32)
 
+        # Optional smoothing (Savitzky-Golay) to reduce zigzag.
+        # IMPORTANT: This must be controlled by the `smooth` flag; otherwise we
+        # may unintentionally change geometry and hurt strict IoU metrics.
         if smooth and len(coords) >= 4:
             try:
                 from scipy.signal import savgol_filter
@@ -315,13 +340,14 @@ class LaneTokenizer:
                 
                 x_eval = coords[:, 0]
                 
-                # FIX 8: Daha güçlü smoothing: window_length=15 for better zigzag removal
-                window_length = min(15, len(x_eval))
+                # V19: Stronger smoothing (window_length=31) to reduce zigzag
+                # Increased from 25 to 31 for better smoothing after Full FPN + Y-loss
+                window_length = min(31, len(x_eval))
                 if window_length % 2 == 0:
                     window_length -= 1
                 
                 if window_length >= 3:
-                    x_smooth = savgol_filter(x_eval, window_length=window_length, polyorder=2)
+                    x_smooth = savgol_filter(x_eval, window_length=window_length, polyorder=3)  # V19: polyorder=3 for smoother curves
                     coords[:, 0] = x_smooth
             except Exception:
                 pass

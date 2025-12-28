@@ -140,3 +140,10 @@ y_in[:, 0] = y_tokens[:, 0]  # GT'nin ilk Y değeri (0)
 - Model sadece X öğrenir
 - Y token'ları zaten sıralı olduğu için sorun olmaz
 
+
+
+
+
+
+
+

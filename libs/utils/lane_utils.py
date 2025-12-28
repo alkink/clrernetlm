@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.interpolate import InterpolatedUnivariateSpline, splev, splprep
+from scipy.interpolate import InterpolatedUnivariateSpline, PchipInterpolator, splev, splprep
 
 
 class Lane:
@@ -10,13 +10,43 @@ class Lane:
     def __init__(self, points=None, invalid_value=-2.0, metadata=None):
         super(Lane, self).__init__()
         self.curr_iter = 0
+        # Ensure points are a float array and sorted by increasing y (required for stable interpolation)
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError(f"Lane points must have shape (N,2), got {points.shape}")
+        order = np.argsort(points[:, 1])
+        points = points[order]
+
+        # Remove duplicate / non-increasing y values (PCHIP requires strictly increasing x)
+        if len(points) > 1:
+            y = points[:, 1]
+            keep = np.concatenate([[True], np.diff(y) > 1e-6])
+            points = points[keep]
+
         self.points = points
         self.invalid_value = invalid_value
-        self.function = InterpolatedUnivariateSpline(
-            points[:, 1], points[:, 0], k=min(3, len(points) - 1)
-        )
-        self.min_y = points[:, 1].min() - 0.01
-        self.max_y = points[:, 1].max() + 0.01
+        # CRITICAL: avoid spline overshoot that can push xs outside [0,1) and get filtered out in CULaneMetric.
+        # Use shape-preserving PCHIP with linear fallback.
+        if len(points) >= 2:
+            y = points[:, 1].astype(np.float64)
+            x = points[:, 0].astype(np.float64)
+            try:
+                self.function = PchipInterpolator(y, x, extrapolate=True)
+            except Exception:
+                # Fallback: linear interpolation
+                def _linear_fn(ys):
+                    return np.interp(np.asarray(ys, dtype=np.float64), y, x)
+                self.function = _linear_fn
+        else:
+            # Degenerate lane: still define a function to satisfy __call__
+            def _const_fn(ys):
+                ys = np.asarray(ys, dtype=np.float64)
+                return np.full_like(ys, fill_value=float(points[0, 0]) if len(points) else 0.0)
+            self.function = _const_fn
+
+        # Keep a small margin consistent with downstream evaluation (CULaneMetric further expands by 0.05)
+        self.min_y = float(points[:, 1].min() - 0.01)
+        self.max_y = float(points[:, 1].max() + 0.01)
 
         self.metadata = metadata or {}
 

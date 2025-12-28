@@ -171,3 +171,10 @@ valid_mask = (x_tokens > 0) & (y_tokens < T)  # X ve Y token'ları
 2. **FIX 2: AUTOREGRESSIVE DECODE DÜZELT** ← ÖNEMLİ
 3. **FIX 3: Y TOKEN FİLTERİNG EKLE** ← İYİLEŞTİRME
 
+
+
+
+
+
+
+

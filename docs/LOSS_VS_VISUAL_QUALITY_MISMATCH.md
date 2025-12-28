@@ -152,3 +152,10 @@ loss = 0.9 * token_loss + 0.1 * pixel_loss
 - Model düzgün çizgiler öğrenir
 - Ama training yavaşlar
 
+
+
+
+
+
+
+

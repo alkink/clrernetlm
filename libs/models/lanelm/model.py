@@ -20,16 +20,18 @@ class KeypointEmbedding(nn.Module):
         max_y_tokens: int,
         embed_dim: int,
         max_len: int,
-        x_embedding_scale: float = 1.0,  # V5: Scale factor for X embedding (reduce dependency on past X)
-        lane_embedding_boost: float = 10.0,  # V5: Boost factor for lane embedding (emphasize visual info)
+        # NOTE: Keep these as knobs for ablations, but default to neutral values
+        # to match the paper more closely (no extra scaling/boost by default).
+        x_embedding_scale: float = 1.0,
+        lane_embedding_boost: float = 1.0,
     ) -> None:
         super().__init__()
         self.nbins_x = nbins_x
         self.max_y_tokens = max_y_tokens
         self.embed_dim = embed_dim
         self.max_len = max_len
-        self.x_embedding_scale = x_embedding_scale  # V5: Default 1.0, V5 uses 0.3
-        self.lane_embedding_boost = lane_embedding_boost  # V5: Default 10.0, V5 uses 15.0
+        self.x_embedding_scale = float(x_embedding_scale)
+        self.lane_embedding_boost = float(lane_embedding_boost)
 
         self.x_embedding = nn.Embedding(nbins_x, embed_dim)
         self.y_embedding = nn.Embedding(max_y_tokens, embed_dim)
@@ -78,7 +80,7 @@ class KeypointEmbedding(nn.Module):
         device = x_tokens.device
         pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
-        # V5: Scale X embedding to reduce dependency on past X tokens
+        # Optional ablation knob: scale the AR x embedding contribution
         x_emb = self.x_embedding(x_tokens) * self.x_embedding_scale
         y_emb = self.y_embedding(y_tokens)
         pos_emb = self.pos_embedding(pos_ids)
@@ -91,8 +93,7 @@ class KeypointEmbedding(nn.Module):
                 lane_indices = lane_indices.unsqueeze(1).expand(-1, seq_len)
             
             lane_emb = self.lane_embedding(lane_indices)
-            # V5: Boost Lane Embedding to emphasize visual information
-            # Original: 10.0, V5: 15.0 (stronger signal for which lane to predict)
+            # Optional ablation knob: boost lane-id embedding contribution
             out = out + (lane_emb * self.lane_embedding_boost)
 
         return out
@@ -307,18 +308,18 @@ class LaneLMDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
 
-        # V5: Self-attention with higher dropout to reduce past X dependency
+        # Paper-style decoder block:
+        # Eq. (9): hi = CrossAtt(Q=CausalSelfAtt(hi-1), K=Li, V=Li)
+        # i.e. causal self-attention FIRST, then cross-attention over visual tokens.
         self.self_attn = nn.MultiheadAttention(
             embed_dim,
             num_heads,
-            dropout=max(dropout, 0.2),  # V5: Minimum 0.2 dropout for self-attention
+            dropout=dropout,
             batch_first=True,
         )
-        # V5: Cross-attention with more heads for stronger visual information
-        cross_attn_heads = num_heads * 2 if num_heads < 16 else num_heads  # Double heads if < 16
         self.cross_attn = nn.MultiheadAttention(
             embed_dim,
-            cross_attn_heads,
+            num_heads,
             dropout=dropout,
             batch_first=True,
         )
@@ -346,22 +347,9 @@ class LaneLMDecoderLayer(nn.Module):
         - tgt_mask: (T, T) causal mask (True for masked positions)
         - memory_key_padding_mask: (B, N) mask for visual tokens
         
-        V5: Visual-First Decoder - Cross-attention FIRST, then self-attention
-        This makes visual information primary and reduces dependency on past X tokens.
+        Paper (Eq. 9): causal self-attention FIRST, then cross-attention.
         """
-        # V5: Cross-attention FIRST (visual information is primary)
-        residual = tgt
-        attn_out, attn_weights = self.cross_attn(
-            tgt,
-            memory,
-            memory,
-            key_padding_mask=memory_key_padding_mask,
-            need_weights=True,  # Keep weights for debugging
-        )
-        # V5: Visual-Query Fusion - add cross-attention output to original query
-        tgt = self.norm1(residual + self.dropout(attn_out))
-
-        # V5: Self-attention SECOND (weakened, with higher dropout)
+        # 1) Causal self-attention (no future leak)
         residual = tgt
         attn_out, _ = self.self_attn(
             tgt,
@@ -370,11 +358,18 @@ class LaneLMDecoderLayer(nn.Module):
             attn_mask=tgt_mask,
             need_weights=False,
         )
-        # V5: Higher dropout for self-attention to reduce past X dependency
-        tgt = self.norm2(residual + self.dropout(attn_out * 0.8))  # Scale down self-attention
-        
-        # Store attention weights for debugging (if needed)
-        # attn_weights shape: (B, num_heads, T, N) where N is num visual tokens
+        tgt = self.norm1(residual + self.dropout(attn_out))
+
+        # 2) Cross-attention (condition on all visual tokens)
+        residual = tgt
+        attn_out, _ = self.cross_attn(
+            tgt,
+            memory,
+            memory,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=False,
+        )
+        tgt = self.norm2(residual + self.dropout(attn_out))
 
         # Feed-forward
         residual = tgt
@@ -504,6 +499,12 @@ class LaneLMModel(nn.Module):
         dropout: float = 0.1,
         visual_in_dim: Optional[int] = None,
         visual_in_channels: Optional[Sequence[int]] = None,
+        # Debug/ablation knobs:
+        # - x_embedding_scale: AR geçmiş x bağımlılığını kontrol eder (overfit debug için 1.0 faydalı).
+        # - lane_embedding_boost: lane slot embedding'in baskınlığını kontrol eder (çok yüksekse görseli bastırabilir).
+        # Default to neutral values to match paper (no extra scaling/boost).
+        x_embedding_scale: float = 1.0,
+        lane_embedding_boost: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -550,14 +551,14 @@ class LaneLMModel(nn.Module):
             else:
                 self.visual_proj = None
 
-        # V5: Keypoint Embedding with reduced X dependency and boosted lane signal
+        # Keypoint Embedding
         self.keypoint_embed = KeypointEmbedding(
             nbins_x=nbins_x,
             max_y_tokens=max_y_tokens,
             embed_dim=embed_dim,
             max_len=max_seq_len,
-            x_embedding_scale=0.3,  # V5: Reduce past X dependency (1.0 -> 0.3)
-            lane_embedding_boost=15.0,  # V5: Boost lane signal (10.0 -> 15.0)
+            x_embedding_scale=float(x_embedding_scale),
+            lane_embedding_boost=float(lane_embedding_boost),
         )
         self.decoder = LaneLMDecoder(
             num_layers=num_layers,
@@ -572,6 +573,15 @@ class LaneLMModel(nn.Module):
             max_y_tokens=max_y_tokens,
         )
 
+        # V6: Lane presence head (per-lane existence probability).
+        # Uses pooled decoder hidden states + valid_ratio to predict lane presence.
+        # V6 FIX: Input dimension is embed_dim + 1 (pooled embedding + valid_ratio)
+        self.presence_head = nn.Sequential(
+            nn.Linear(embed_dim + 1, embed_dim),  # +1 for valid_ratio
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, 1),
+        )
+
     def forward(
         self,
         visual_tokens: torch.Tensor,
@@ -579,6 +589,7 @@ class LaneLMModel(nn.Module):
         y_tokens: torch.Tensor,
         visual_padding_mask: Optional[torch.Tensor] = None,
         lane_indices: Optional[torch.Tensor] = None,
+        return_presence: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
@@ -642,7 +653,34 @@ class LaneLMModel(nn.Module):
             memory_key_padding_mask=visual_padding_mask,
         )
         logits_x, logits_y = self.head(hidden)
-        return logits_x, logits_y
+
+        if not return_presence:
+            return logits_x, logits_y
+
+        # ----- Lane presence prediction -----
+        # Pool decoder hidden states over valid timesteps to obtain a per-lane vector.
+        # Valid tokens are those where x_tokens != pad_token_x and y_tokens != pad_y.
+        pad_token_x = 0  # By design, tokenizer reserves 0 as padding for X.
+        pad_y = self.max_y_tokens - 1  # Tokenizer uses T (num_steps) as padding index for Y.
+
+        # x_tokens, y_tokens: (B, T)
+        valid_mask = (x_tokens != pad_token_x) & (y_tokens != pad_y)
+        valid_count = valid_mask.sum(dim=1, keepdim=True).float()  # (B, 1)
+        T = x_tokens.shape[1]
+        valid_ratio = valid_count / T  # (B, 1) - ratio of valid tokens [0, 1]
+        
+        # Pool hidden states for valid tokens
+        valid_mask_f = valid_mask.unsqueeze(-1).float()  # (B, T, 1)
+        mask_sum_safe = valid_count.clone()
+        mask_sum_safe[mask_sum_safe == 0] = 1  # Avoid division by zero
+        pooled = (hidden * valid_mask_f).sum(dim=1) / mask_sum_safe  # (B, D)
+        
+        # CRITICAL FIX: Concatenate pooled embedding with valid_ratio
+        # This allows presence head to learn: "few valid tokens = negative, many valid tokens = positive"
+        pooled_with_ratio = torch.cat([pooled, valid_ratio], dim=1)  # (B, D+1)
+        
+        presence_logits = self.presence_head(pooled_with_ratio)  # (B, 1)
+        return logits_x, logits_y, presence_logits
 
     def encode_visual_tokens(self, feats: Sequence[torch.Tensor]) -> torch.Tensor:
         """Encode multi-level FPN features into visual tokens.

@@ -128,3 +128,10 @@ loss = (loss_weights.view(-1) * loss_per_token).mean()
 - İlk birkaç token daha doğru olmalı
 - Zigzag azalmalı
 
+
+
+
+
+
+
+
